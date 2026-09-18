@@ -21,7 +21,7 @@
 Загрузиться с CachyOS ISO (UEFI, сеть поднята), выполнить от root:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mr-addams/cachyos-install-on-mdraid/v1.0.0/boot.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/mr-addams/cachyos-install-on-mdraid/v1.1.0/boot.sh | sudo bash
 ```
 
 > ⚠️ **Скрипт разрушающий**: оба указанных диска будут полностью зачищены
@@ -40,12 +40,43 @@ curl -fsSL https://raw.githubusercontent.com/mr-addams/cachyos-install-on-mdraid
 | `P510_REPO` | `mr-addams/cachyos-install-on-mdraid` | форк/зеркало репозитория |
 | `P510_REF` | `main` | ветка/тег для клонирования |
 
+## Два режима — оба по SSH
+
+Инвариант проекта: ручная и быстрая установки одинаково запускаются через SSH,
+чтобы потом автоматизировать.
+
+**Ручной (интерактив + TUI):** нужен TTY — запускать с `ssh -t`:
+
+```bash
+ssh -t liveiso 'curl -fsSL https://raw.githubusercontent.com/mr-addams/cachyos-install-on-mdraid/v1.1.0/boot.sh | sudo bash'
+```
+
+`boot.sh` перецепляет stdin с pipe на `/dev/tty`, дальше обычный опрос + TUI фазы B.
+
+**Быстрый (сценарий, без TTY):**
+
+```bash
+cp scenario.example.env stand.env   # заполнить: диски, пароли, CONFIRM_DESTROY=yes
+chmod 600 stand.env
+scp stand.env liveiso:/tmp/stand.env
+ssh liveiso 'curl -fsSL https://raw.githubusercontent.com/mr-addams/cachyos-install-on-mdraid/v1.1.0/boot.sh | sudo bash -s -- --unattended --scenario /tmp/stand.env'
+```
+
+Сценарий — env-файл (пример: `scenario.example.env`). Фаза B идёт через
+`archinstall --silent` с логом `/tmp/archinstall-silent.log`, весь прогон —
+в `/tmp/p510-install.log`. Локаль, пользователи, sudoers, NetworkManager
+донастраиваются детерминированно в фазе C (TUI-режим этот блок пропускает).
+Пароли после установки затираются `shred`. Нюанс: если сборка archinstall
+на ISO не знает ядро `linux-cachyos`, скрипт временно ставит ванильный `linux`,
+а фаза C меняет его на запрошенное.
+
 ## Файлы
 
 | Файл | Назначение |
 |------|------------|
 | `boot.sh` | bootstrap: ставит `git`/`curl` в live-ISO, клонирует репо по пину, запускает установщик |
-| `install-cachyos-refind-mdraid.sh` | основной интерактивный установщик (фазы A–D) |
+| `install-cachyos-refind-mdraid.sh` | основной установщик: интерактив по умолчанию, `--unattended --scenario` для автоматики (фазы A–D) |
+| `scenario.example.env` | шаблон сценария для unattended-режима |
 | `cachyos-refind-mdraid-install.md` | ручная пошаговая инструкция (тот же процесс без автоматики) |
 
 Процесс установщика: фаза A — разметка, mdraid, mkfs, монтирование;

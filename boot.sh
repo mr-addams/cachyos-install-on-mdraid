@@ -2,11 +2,14 @@
 # ==============================================================================
 # Bootstrap для запуска установки из CachyOS live-ISO.
 #
-# Запуск одной строкой (root):
+# Интерактив (нужен TTY):
 #   curl -fsSL https://raw.githubusercontent.com/mr-addams/cachyos-install-on-mdraid/main/boot.sh | sudo bash
 #
-# Для живого железа — пин на тег, а не на плавающий main:
-#   curl -fsSL https://raw.githubusercontent.com/mr-addams/cachyos-install-on-mdraid/v1.0.0/boot.sh | sudo bash
+# Unattended по SSH (без TTY):
+#   scp stand.env liveiso:/tmp/stand.env
+#   ssh liveiso 'curl -fsSL .../main/boot.sh | sudo bash -s -- --unattended --scenario /tmp/stand.env'
+#
+# Для живого железа — пин на тег, а не на плавающий main (пример: v1.1.0).
 #
 # Переменные окружения:
 #   P510_REPO — owner/repo (дефолт: mr-addams/cachyos-install-on-mdraid)
@@ -49,5 +52,15 @@ if [[ ! -f "$WORKDIR/$MAIN_SCRIPT" ]]; then
     exit 1
 fi
 
-echo "==> Запускаю $MAIN_SCRIPT"
-exec bash "$WORKDIR/$MAIN_SCRIPT"
+echo "==> Запускаю $MAIN_SCRIPT $*"
+NEEDS_TTY=1
+for arg in "$@"; do
+    if [[ "$arg" == "--unattended" ]]; then NEEDS_TTY=0; fi
+done
+if [[ $NEEDS_TTY -eq 1 ]]; then
+    # Интерактиву нужен TTY, а stdin у нас — pipe от curl. Перецепляем клавиатуру,
+    # иначе основной скрипт честно упадёт на TTY-guard. Аргументы пробрасываем.
+    exec bash "$WORKDIR/$MAIN_SCRIPT" "$@" </dev/tty
+else
+    exec bash "$WORKDIR/$MAIN_SCRIPT" "$@"
+fi

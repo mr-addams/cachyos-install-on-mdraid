@@ -33,6 +33,53 @@ log_error() {
 }
 
 # ==============================================================================
+# Режимы работы (инвариант: оба запускаются по SSH)
+#   Интерактив (дефолт): опрос + TUI фазы B. Нужен TTY (ssh -t; boot.sh
+#     перецепляет stdin с pipe на /dev/tty).
+#   --unattended --scenario FILE: ноль вопросов, фаза B через archinstall
+#     --silent. Работает вообще без TTY — пригодно для автоматизации.
+# Без TTY и без --unattended — fail fast, чтобы не висеть на read в трубе.
+# ==============================================================================
+MODE="interactive"
+SCENARIO_FILE=""
+LOG_FILE="/tmp/p510-install.log"
+KERNEL_PKG="linux-cachyos"
+SWAP_KERNEL=0
+
+usage() {
+    echo "Использование:"
+    echo "  $0 [--unattended --scenario FILE] [--log FILE]"
+    echo "Примеры:"
+    echo "  $0                                        # интерактив, нужен TTY"
+    echo "  $0 --unattended --scenario /tmp/stand.env  # сценарий, без вопросов"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --unattended) MODE="unattended"; shift ;;
+        --scenario) SCENARIO_FILE="${2:-}"; shift 2 ;;
+        --log) LOG_FILE="${2:-}"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Неизвестный аргумент: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
+
+if [[ "$MODE" == "unattended" && -z "$SCENARIO_FILE" ]]; then
+    echo "--unattended требует --scenario FILE" >&2
+    exit 1
+fi
+
+if [[ "$MODE" == "interactive" && ! -t 0 ]]; then
+    echo "Интерактивному режиму нужен TTY (stdin — не терминал)." >&2
+    echo "Варианты: запуск через boot.sh (перецепляет /dev/tty), ssh -t, или --unattended --scenario FILE." >&2
+    exit 1
+fi
+
+# Лог всего прогона: в unattended по SSH это единственный способ понять падение.
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "==> Лог: $LOG_FILE | режим: $MODE"
+
+# ==============================================================================
 # Шаг 0: Проверка окружения
 # ==============================================================================
 log_step "Шаг 0: Проверка окружения"
@@ -85,7 +132,82 @@ fi
 # ==============================================================================
 # Шаг 1: Интерактивный опрос переменных
 # ==============================================================================
-log_step "Шаг 1: Опрос переменных"
+log_step "Шаг 1: Параметры"
+
+# Сценарий — обычный env-файл KEY=VALUE (см. scenario.example.env).
+# Почему source, а не JSON+jq: на live-ISO гарантированно есть только bash,
+# jq/python-зависимостей для парсинга не требуем. Значения со спецсимволами
+# (пароли) — в одинарных кавычках, файл chmod 600, после использования shred.
+load_scenario() {
+    if [[ ! -f "$SCENARIO_FILE" ]]; then
+        log_error "Файл сценария не найден: $SCENARIO_FILE"
+        exit 1
+    fi
+    set -a
+    # shellcheck disable=SC1090
+    source "$SCENARIO_FILE"
+    set +a
+
+    for var in DISK1 DISK2 HOSTNAME USERNAME USER_PASSWORD ROOT_PASSWORD; do
+        if [[ -z "${!var:-}" ]]; then
+            log_error "В сценарии нет обязательной переменной $var"
+            exit 1
+        fi
+    done
+
+    # Единственное подтверждение разрушения в unattended: человек, писавший
+    # сценарий, явно разрешил снос. Без этого — стоп, никаких дефолтов.
+    if [[ "${CONFIRM_DESTROY:-no}" != "yes" ]]; then
+        log_error "Unattended требует CONFIRM_DESTROY=yes в сценарии"
+        exit 1
+    fi
+
+    ESP_SIZE=${ESP_SIZE:-512MiB}
+    BOOT_SIZE=${BOOT_SIZE:-1GiB}
+    ROOT_SIZE=${ROOT_SIZE:-}
+    ROOT_LABEL=${ROOT_LABEL:-cachy_root}
+    BOOT_LABEL=${BOOT_LABEL:-cachy_boot}
+    EXTRA_PKGS=${EXTRA_PKGS:-}
+    TIMEZONE=${TIMEZONE:-UTC}
+    LOCALE=${LOCALE:-en_US.UTF-8}
+    KEYMAP=${KEYMAP:-us}
+    KERNEL_PKG=${KERNEL_PKG:-linux-cachyos}
+
+    if [[ "$DISK1" == "$DISK2" ]]; then
+        log_error "Диски должны быть разными"
+        exit 1
+    fi
+    for d in "$DISK1" "$DISK2"; do
+        if [[ ! -b "/dev/$d" ]]; then
+            log_error "Диск /dev/$d не существует"
+            exit 1
+        fi
+    done
+    if [[ ! "$ROOT_LABEL" =~ ^[A-Za-z0-9_-]{1,16}$ ]]; then
+        log_error "Метка root '$ROOT_LABEL': только [A-Za-z0-9_-], длина 1-16"
+        exit 1
+    fi
+    if [[ ! "$BOOT_LABEL" =~ ^[A-Za-z0-9_-]{1,16}$ ]]; then
+        log_error "Метка /boot '$BOOT_LABEL': только [A-Za-z0-9_-], длина 1-16"
+        exit 1
+    fi
+    if [[ ! "$HOSTNAME" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then
+        log_error "Некорректный hostname: '$HOSTNAME'"
+        exit 1
+    fi
+    if [[ ! "$KERNEL_PKG" =~ ^[a-z0-9+_.-]+$ ]]; then
+        log_error "Некорректное имя пакета ядра: '$KERNEL_PKG'"
+        exit 1
+    fi
+
+    echo "==> Сценарий $SCENARIO_FILE загружен и проверен"
+    echo "    Диски: /dev/$DISK1 + /dev/$DISK2 | host: $HOSTNAME | user: $USERNAME | kernel: $KERNEL_PKG"
+}
+
+if [[ "$MODE" == "unattended" ]]; then
+    echo "==> Режим unattended: параметры из сценария"
+    load_scenario
+else
 
 echo "Доступные диски:"
 lsblk -d -o NAME,SIZE,MODEL
@@ -160,6 +282,8 @@ fi
 read -rp "Доп. пакеты для заметки на память (архинсталл спросит сам, тут только справочно): " EXTRA_PKGS
 EXTRA_PKGS=${EXTRA_PKGS:-}
 
+fi  # конец ветки interactive (unattended брал всё из load_scenario выше)
+
 # ==============================================================================
 # Шаг 2: Формирование и отображение плана разметки
 # ==============================================================================
@@ -190,13 +314,18 @@ echo "
 # ==============================================================================
 # Шаг 3: Подтверждение перед разрушающими действиями
 # ==============================================================================
-log_warn "ВНИМАНИЕ: Все данные на дисках /dev/$DISK1 и /dev/$DISK2 будут УНИЧТОЖЕНЫ!"
-read -rp "Продолжить? (yes/no) [no]: " CONFIRM
-CONFIRM=${CONFIRM:-no}
+if [[ "$MODE" == "unattended" ]]; then
+    # Подтверждением служит CONFIRM_DESTROY=yes в сценарии (проверен в load_scenario).
+    echo "==> Unattended: подтверждение сноса — CONFIRM_DESTROY=yes из сценария"
+else
+    log_warn "ВНИМАНИЕ: Все данные на дисках /dev/$DISK1 и /dev/$DISK2 будут УНИЧТОЖЕНЫ!"
+    read -rp "Продолжить? (yes/no) [no]: " CONFIRM
+    CONFIRM=${CONFIRM:-no}
 
-if [[ "$CONFIRM" != "yes" ]]; then
-    log_error "Установка отменена пользователем"
-    exit 1
+    if [[ "$CONFIRM" != "yes" ]]; then
+        log_error "Установка отменена пользователем"
+        exit 1
+    fi
 fi
 
 # ==============================================================================
@@ -416,12 +545,78 @@ echo "==> Предзаполнение bootloader: '$BOOTLOADER_VALUE' (пров
 log_step "Шаг 10: Генерация JSON-конфига archinstall"
 
 ARCHINSTALL_CONFIG="/tmp/archinstall-disk-config.json"
+INSTALL_KERNEL="$KERNEL_PKG"
+
+# Проверяем, знает ли archinstall на этом ISO запрошенное ядро как допустимое
+# значение kernels (ванильный enum: linux, linux-lts, zen... — linux-cachyos
+# там есть только если сборка CachyOS пропатчила archinstall).
+# Способ: ищем имя пакета в исходниках установленного archinstall — грубый,
+# но не зависит от пути Python-модуля, который плавает между версиями.
+probe_kernel_pkg() {
+    local pkgdir
+    pkgdir=$(python3 -c "import archinstall, os; print(os.path.dirname(archinstall.__file__))" 2>/dev/null) || return 1
+    grep -rq -- "$KERNEL_PKG" "$pkgdir" 2>/dev/null
+}
+
+if [[ "$MODE" == "unattended" ]]; then
+    if ! command -v archinstall &> /dev/null; then
+        log_error "Unattended-режиму нужен бинарник archinstall (batch через --silent)."
+        echo "На этом ISO есть только '$INSTALLER'. Либо ставьте через TUI (интерактив),"
+        echo "либо используйте ISO с archinstall."
+        exit 1
+    fi
+    if [[ "$KERNEL_PKG" != "linux" ]] && ! probe_kernel_pkg; then
+        log_warn "archinstall не знает ядро '$KERNEL_PKG' — ставлю ванильный linux,"
+        log_warn "Фаза C заменит его на '$KERNEL_PKG' (SWAP_KERNEL=1)"
+        INSTALL_KERNEL="linux"
+        SWAP_KERNEL=1
+    else
+        echo "==> Ядро '$KERNEL_PKG' поддерживается конфигом — ставим сразу"
+    fi
+fi
 
 # Схема: актуальный ключ bootloader_config + устаревший bootloader рядом.
 # Почему оба: свежий archinstall читает bootloader_config (args.py), старый —
 # только bootloader (deprecated-фолбэк). Дублирование безвредно: новый приоритетно
 # берёт bootloader_config, старый игнорирует неизвестный ключ.
-cat > "$ARCHINSTALL_CONFIG" << CONFEOF
+#
+# Остальные ключи silent-конфига — только с известной формой (man archinstall 2.6.0):
+# disk_config, hostname, kernels, packages, locale_config {kb_layout, sys_enc,
+# sys_lang}, timezone (строка). Сеть, пользователи, sudoers, NetworkManager —
+# детерминированно делает Фаза C (блок C.9), а не угадывание схемы creds.
+if [[ "$MODE" == "unattended" ]]; then
+    SYS_LANG=${LOCALE%%.*}
+    PKG_LIST=(base base-devel "$INSTALL_KERNEL" mdadm efibootmgr refind vim networkmanager rsync gdisk dosfstools)
+    if [[ -n "$EXTRA_PKGS" ]]; then
+        # shellcheck disable=SC2206
+        PKG_LIST+=($EXTRA_PKGS)
+    fi
+    PKGS_JSON=$(printf '"%s",' "${PKG_LIST[@]}")
+    PKGS_JSON="[${PKGS_JSON%,}]"
+
+    cat > "$ARCHINSTALL_CONFIG" << CONFEOF
+{
+    "disk_config": {
+        "config_type": "pre_mounted_config",
+        "mountpoint": "/mnt"
+    },
+    "bootloader_config": {
+        "bootloader": "$BOOTLOADER_VALUE"
+    },
+    "bootloader": "$BOOTLOADER_VALUE",
+    "hostname": "$HOSTNAME",
+    "kernels": ["$INSTALL_KERNEL"],
+    "packages": $PKGS_JSON,
+    "locale_config": {
+        "kb_layout": "$KEYMAP",
+        "sys_enc": "UTF-8",
+        "sys_lang": "$SYS_LANG"
+    },
+    "timezone": "$TIMEZONE"
+}
+CONFEOF
+else
+    cat > "$ARCHINSTALL_CONFIG" << CONFEOF
 {
     "disk_config": {
         "config_type": "pre_mounted_config",
@@ -434,6 +629,7 @@ cat > "$ARCHINSTALL_CONFIG" << CONFEOF
     "hostname": "$HOSTNAME"
 }
 CONFEOF
+fi
 
 echo "==> Конфиг сохранён: $ARCHINSTALL_CONFIG"
 echo "--- Содержимое ---"
@@ -443,6 +639,32 @@ echo "--- конец ---"
 # ==============================================================================
 # Шаг 11: Запуск инсталлятора
 # ==============================================================================
+if [[ "$MODE" == "unattended" ]]; then
+    log_step "Шаг 11: Запуск archinstall --silent"
+
+    ARCHINSTALL_LOG="/tmp/archinstall-silent.log"
+    echo "==> archinstall --config $ARCHINSTALL_CONFIG --silent (лог: $ARCHINSTALL_LOG)"
+    if archinstall --config "$ARCHINSTALL_CONFIG" --silent >"$ARCHINSTALL_LOG" 2>&1; then
+        echo "==> Silent-установка завершена успешно"
+    else
+        INSTALLER_EXIT=$?
+        log_error "archinstall --silent упал (код $INSTALLER_EXIT). Хвост лога:"
+        tail -n 50 "$ARCHINSTALL_LOG"
+        # Откат на TUI — только если вообще есть с кем разговаривать.
+        # Без TTY (автоматизация) — жёсткий выход с кодом ошибки.
+        if [[ -t 0 ]]; then
+            read -rp "Открыть TUI вручную для добивки? (yes/no) [no]: " BARE_CONFIRM
+            BARE_CONFIRM=${BARE_CONFIRM:-no}
+            if [[ "$BARE_CONFIRM" == "yes" ]]; then
+                archinstall --config "$ARCHINSTALL_CONFIG" || true
+            else
+                exit $INSTALLER_EXIT
+            fi
+        else
+            exit $INSTALLER_EXIT
+        fi
+    fi
+else
 log_step "Шаг 11: Запуск CachyOS TUI-инсталлятора"
 
 echo "Инсталлятор запустится в режиме pre_mounted_config."
@@ -478,7 +700,8 @@ else
             log_warn "Голый запуск завершился с кодом $?"
         fi
     fi
-fi
+fi  # конец if $INSTALLER --config
+fi  # конец ветки interactive шага 11 (if MODE)
 
 # ==============================================================================
 # Шаг 12: Проверка после инсталлятора
@@ -559,6 +782,23 @@ else
 fi
 
 # ------------------------------------------------------------------
+# C.2b: Откатное ядро — silent-конфиг мог поставить ванильный linux,
+#        т.к. enum archinstall не знает linux-cachyos (см. probe_kernel_pkg).
+#        Ставим запрошенное, проверяем образ, только потом сносим ваниль.
+#        В интерактиве SWAP всегда 0 — блок молча пропускается.
+# ------------------------------------------------------------------
+if [[ "SWAP_KERNEL_PLACEHOLDER" == "1" ]]; then
+    echo "==> C.2b: Замена ядра linux -> KERNEL_PKG_PLACEHOLDER"
+    pacman -S --noconfirm --needed KERNEL_PKG_PLACEHOLDER
+    if [[ -f /boot/vmlinuz-KERNEL_PKG_PLACEHOLDER ]]; then
+        pacman -R --noconfirm linux || true
+    else
+        echo "    ОШИБКА: образ /boot/vmlinuz-KERNEL_PKG_PLACEHOLDER не появился" >&2
+        exit 1
+    fi
+fi
+
+# ------------------------------------------------------------------
 # C.3: Пересборка initramfs
 # ------------------------------------------------------------------
 echo "==> C.3: mkinitcpio -P"
@@ -626,12 +866,31 @@ fi
 # ------------------------------------------------------------------
 echo "==> C.7: Генерация /boot/efi/EFI/refind/refind.conf"
 ROOT_UUID=$(blkid -s UUID -o value /dev/md1)
+# Образ ядра — не хардкод: silent с откатом ставит linux, интерактив — что
+# выбрал пользователь в TUI. Приоритет запрошенному пакету, иначе первый образ.
+KIMG=""
+if [[ -f /boot/vmlinuz-KERNEL_PKG_PLACEHOLDER ]]; then
+    KIMG="vmlinuz-KERNEL_PKG_PLACEHOLDER"
+else
+    KIMG=$(basename "$(ls /boot/vmlinuz-* 2>/dev/null | head -n1)" 2>/dev/null || true)
+fi
+if [[ -z "$KIMG" ]]; then
+    echo "    ОШИБКА: в /boot нет ни одного vmlinuz-*" >&2
+    exit 1
+fi
+KVER=${KIMG#vmlinuz-}
+INITRD="initramfs-$KVER.img"
+if [[ ! -f "/boot/$INITRD" ]]; then
+    echo "    ОШИБКА: в /boot нет $INITRD" >&2
+    exit 1
+fi
+echo "    Ядро для стансы: /$KIMG + /$INITRD"
 cat > /boot/efi/EFI/refind/refind.conf << REFIND_CONF_EOF
 menuentry "CachyOS" {
     icon     /EFI/refind/icons/os_arch.png
     volume   "BOOT_LABEL_PLACEHOLDER"
-    loader   /vmlinuz-linux-cachyos
-    initrd   /initramfs-linux-cachyos.img
+    loader   /$KIMG
+    initrd   /$INITRD
     options  "root=UUID=${ROOT_UUID} rw quiet splash"
 }
 REFIND_CONF_EOF
@@ -675,6 +934,40 @@ ensure_fstab_entry ESP_DEVICE_PLACEHOLDER /boot/efi vfat "rw,relatime,fmask=0022
 echo "    Итоговый fstab:"
 cat /etc/fstab | sed 's/^/      /'
 
+# ------------------------------------------------------------------
+# C.9: Локаль/пользователи — только если Фаза B была silent.
+#       Признак: сценарный файл, подложенный внешним скриптом в /tmp.
+#       TUI-режим уже всё настроил сам — блок пропускается.
+#       Пароли живут только в этом файле (600) и затираются shred в конце.
+# ------------------------------------------------------------------
+if [[ -f /tmp/p510-scenario.env ]]; then
+    echo "==> C.9: Локаль и пользователи из сценария"
+    chmod 600 /tmp/p510-scenario.env
+    set -a
+    # shellcheck disable=SC1090
+    source /tmp/p510-scenario.env
+    set +a
+
+    ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+    hwclock --systohc || true
+    sed -i "s/^#\(${LOCALE%%.*}.*UTF-8\)/\1/" /etc/locale.gen
+    locale-gen || echo "    ВНИМАНИЕ: locale-gen с ошибками — проверьте /etc/locale.gen"
+    echo "LANG=$LOCALE" > /etc/locale.conf
+    echo "KEYMAP=$KEYMAP" > /etc/vconsole.conf
+
+    useradd -m -G wheel -s /bin/bash "$USERNAME"
+    echo "$USERNAME:$USER_PASSWORD" | chpasswd
+    echo "root:$ROOT_PASSWORD" | chpasswd
+    echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/10-wheel
+    chmod 440 /etc/sudoers.d/10-wheel
+    systemctl enable NetworkManager
+
+    shred -u /tmp/p510-scenario.env
+    echo "    Пользователь $USERNAME создан, сценарный файл затёрт"
+else
+    echo "==> C.9: сценарного файла нет (TUI-режим) — пропускаю"
+fi
+
 echo "==> [Фаза C] Донастройка завершена"
 CHROOT_EOF
 
@@ -683,10 +976,21 @@ chmod +x /mnt/tmp/chroot-setup.sh
 # Подстановка переменных в chroot-скрипт
 sed -i "s|ESP_DEVICE_PLACEHOLDER|/dev/$PART1_1|g" /mnt/tmp/chroot-setup.sh
 sed -i "s|BOOT_LABEL_PLACEHOLDER|$BOOT_LABEL|g" /mnt/tmp/chroot-setup.sh
+sed -i "s|KERNEL_PKG_PLACEHOLDER|$KERNEL_PKG|g; s|SWAP_KERNEL_PLACEHOLDER|$SWAP_KERNEL|g" /mnt/tmp/chroot-setup.sh
+
+# Сценарный файл — в таргет для блока C.9 (только unattended; в интерактиве
+# SCENARIO_FILE пуст и копировать нечего). Права 600 — там пароли.
+if [[ "$MODE" == "unattended" ]]; then
+    cp "$SCENARIO_FILE" /mnt/tmp/p510-scenario.env
+    chmod 600 /mnt/tmp/p510-scenario.env
+fi
 
 # Выполнение chroot-скрипта
 echo "==> Запуск настройки в chroot"
 arch-chroot /mnt /bin/bash /tmp/chroot-setup.sh
+
+# Блок C.9 затирает сценарный файл изнутри; это — страховка на случай обрыва.
+rm -f /mnt/tmp/p510-scenario.env
 
 # ==============================================================================
 # ФАЗА D — Зеркалирование ESP + автохук
