@@ -1,2 +1,6 @@
 opencode.json
 tmp/
+# Боевые сценарии с паролями — никогда в git
+stand.env
+*.env
+!scenario.example.env

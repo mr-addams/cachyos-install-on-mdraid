@@ -172,6 +172,13 @@ load_scenario() {
     LOCALE=${LOCALE:-en_US.UTF-8}
     KEYMAP=${KEYMAP:-us}
     KERNEL_PKG=${KERNEL_PKG:-linux-cachyos}
+    # Доп. пакеты к ядру (headers, LTS, драйвер): ставятся фазой C вместе
+    # со swap ядра. Пусто = только KERNEL_PKG.
+    KERNEL_EXTRA_PKGS=${KERNEL_EXTRA_PKGS:-}
+    # Метки ESP (FAT: до 11 символов). Shell пользователя в таргете.
+    ESP_LABEL1=${ESP_LABEL1:-EFI-0}
+    ESP_LABEL2=${ESP_LABEL2:-EFI-1}
+    USER_SHELL=${USER_SHELL:-/bin/bash}
 
     if [[ "$DISK1" == "$DISK2" ]]; then
         log_error "Диски должны быть разными"
@@ -199,9 +206,23 @@ load_scenario() {
         log_error "Некорректное имя пакета ядра: '$KERNEL_PKG'"
         exit 1
     fi
+    for kp in $KERNEL_EXTRA_PKGS; do
+        if [[ ! "$kp" =~ ^[a-z0-9+_.-]+$ ]]; then
+            log_error "Некорректное имя пакета в KERNEL_EXTRA_PKGS: '$kp'"
+            exit 1
+        fi
+    done
+    if [[ ! "$ESP_LABEL1" =~ ^[A-Za-z0-9_-]{1,11}$ ]] || [[ ! "$ESP_LABEL2" =~ ^[A-Za-z0-9_-]{1,11}$ ]]; then
+        log_error "Метки ESP '$ESP_LABEL1'/'$ESP_LABEL2': только [A-Za-z0-9_-], длина 1-11 (FAT)"
+        exit 1
+    fi
+    if [[ ! "$USER_SHELL" =~ ^/(bin|usr/bin)/(bash|zsh|fish)$ ]]; then
+        log_error "USER_SHELL '$USER_SHELL': только /bin/bash, /bin/zsh, /usr/bin/fish"
+        exit 1
+    fi
 
     echo "==> Сценарий $SCENARIO_FILE загружен и проверен"
-    echo "    Диски: /dev/$DISK1 + /dev/$DISK2 | host: $HOSTNAME | user: $USERNAME | kernel: $KERNEL_PKG"
+    echo "    Диски: /dev/$DISK1 + /dev/$DISK2 | host: $HOSTNAME | user: $USERNAME ($USER_SHELL) | kernel: $KERNEL_PKG + [$KERNEL_EXTRA_PKGS]"
 }
 
 if [[ "$MODE" == "unattended" ]]; then
@@ -256,6 +277,15 @@ ROOT_LABEL=${ROOT_LABEL:-cachy_root}
 read -rp "Метка /boot [cachy_boot]: " BOOT_LABEL
 BOOT_LABEL=${BOOT_LABEL:-cachy_boot}
 
+read -rp "Метка ESP на первом диске [EFI-0]: " ESP_LABEL1
+ESP_LABEL1=${ESP_LABEL1:-EFI-0}
+
+read -rp "Метка ESP на втором диске [EFI-1]: " ESP_LABEL2
+ESP_LABEL2=${ESP_LABEL2:-EFI-1}
+
+read -rp "Shell пользователя [/bin/bash]: " USER_SHELL
+USER_SHELL=${USER_SHELL:-/bin/bash}
+
 # Метки ext4 — макс. 16 символов, иначе mkfs обрежет молча и volume в
 # refind.conf не совпадёт с реальной меткой (система не загрузится).
 if [[ ! "$ROOT_LABEL" =~ ^[A-Za-z0-9_-]{1,16}$ ]]; then
@@ -264,6 +294,14 @@ if [[ ! "$ROOT_LABEL" =~ ^[A-Za-z0-9_-]{1,16}$ ]]; then
 fi
 if [[ ! "$BOOT_LABEL" =~ ^[A-Za-z0-9_-]{1,16}$ ]]; then
     log_error "Метка /boot '$BOOT_LABEL': только [A-Za-z0-9_-], длина 1-16"
+    exit 1
+fi
+if [[ ! "$ESP_LABEL1" =~ ^[A-Za-z0-9_-]{1,11}$ ]] || [[ ! "$ESP_LABEL2" =~ ^[A-Za-z0-9_-]{1,11}$ ]]; then
+    log_error "Метки ESP '$ESP_LABEL1'/'$ESP_LABEL2': только [A-Za-z0-9_-], длина 1-11 (FAT)"
+    exit 1
+fi
+if [[ ! "$USER_SHELL" =~ ^/(bin|usr/bin)/(bash|zsh|fish)$ ]]; then
+    log_error "USER_SHELL '$USER_SHELL': только /bin/bash, /bin/zsh, /usr/bin/fish"
     exit 1
 fi
 
@@ -302,6 +340,8 @@ echo "
   Метки:
     /boot: $BOOT_LABEL
     /:     $ROOT_LABEL
+    ESP1:  $ESP_LABEL1
+    ESP2:  $ESP_LABEL2
 
   Hostname: $HOSTNAME
 
@@ -401,15 +441,30 @@ fi
 # (metadata 1.0 живёт в конце устройства, 1.2 — со сдвигом 4K — оба переживают
 # пересоздание таблицы). Без зачистки mdadm --create упрётся в
 # "appears to be part of an array" именно на повторном прогоне скрипта.
+# Плюс гонка: udev инкрементально пересобирает массивы из свежих разделов
+# (смещения те же, суперблоки ещё на месте) раньше, чем мы дойдём до wipefs.
+# Поэтому перед зачисткой — повторный стоп всего, что успело пересобраться.
+# Сначала перечитать таблицы: без partprobe свежих узлов /dev/sdX3 может
+# вообще не быть (ядро держит старую таблицу) — wipefs падает «No such file»,
+# а при set -e это смерть прогона.
+# Побочка partprobe: udev тут же пересобирает массивы из старых суперблоков
+# (смещения разделов те же) — поэтому сразу за ним повторный стоп.
+partprobe "/dev/$DISK1" "/dev/$DISK2"
+udevadm settle
+for reassembled_md in /dev/md0 /dev/md1; do
+    if [[ -b "$reassembled_md" ]]; then
+        log_warn "udev пересобрал $reassembled_md из свежих разделов — останавливаю"
+        mdadm --stop "$reassembled_md" || true
+    fi
+done
 echo "==> Зачистка сигнатур на новых разделах"
 wipefs -a "/dev/$PART1_1" "/dev/$PART1_2" "/dev/$PART1_3" \
          "/dev/$PART2_1" "/dev/$PART2_2" "/dev/$PART2_3"
 mdadm --zero-superblock "/dev/$PART1_2" "/dev/$PART1_3" \
                        "/dev/$PART2_2" "/dev/$PART2_3" 2>/dev/null || true
 
-# Ядро кеширует таблицу разделов: без partprobe+settle следующий mdadm --create
-# может не увидеть свежие /dev/sdX2 (гонка udev, особенно на NVMe).
-partprobe "/dev/$DISK1" "/dev/$DISK2"
+# Суперблоки затёрты выше — пересобраться массивам не из чего.
+# Финальный settle перед --create (таблицы уже перечитаны, узлы на месте).
 udevadm settle
 echo "==> Таблицы разделов перечитаны — OK"
 
@@ -419,27 +474,39 @@ echo "==> Таблицы разделов перечитаны — OK"
 log_step "Шаг 5: Создание RAID-массивов"
 
 # Проверка, не существуют ли уже массивы
+# В unattended без TTY read вернёт EOF и упадёт в exit — поэтому при
+# CONFIRM_DESTROY=yes останавливаем молча: снос уже разрешён сценарием.
 if [[ -b /dev/md0 ]]; then
-    log_warn "Устройство /dev/md0 уже существует!"
-    read -rp "Пересоздать? (yes/no) [no]: " RECREATE_MD0
-    RECREATE_MD0=${RECREATE_MD0:-no}
-    if [[ "$RECREATE_MD0" == "yes" ]]; then
+    if [[ "$MODE" == "unattended" ]]; then
+        log_warn "Unattended: останавливаю существующий /dev/md0 без спроса"
         mdadm --stop /dev/md0 || true
     else
-        log_error "Невозможно продолжить с существующим /dev/md0"
-        exit 1
+        log_warn "Устройство /dev/md0 уже существует!"
+        read -rp "Пересоздать? (yes/no) [no]: " RECREATE_MD0
+        RECREATE_MD0=${RECREATE_MD0:-no}
+        if [[ "$RECREATE_MD0" == "yes" ]]; then
+            mdadm --stop /dev/md0 || true
+        else
+            log_error "Невозможно продолжить с существующим /dev/md0"
+            exit 1
+        fi
     fi
 fi
 
 if [[ -b /dev/md1 ]]; then
-    log_warn "Устройство /dev/md1 уже существует!"
-    read -rp "Пересоздать? (yes/no) [no]: " RECREATE_MD1
-    RECREATE_MD1=${RECREATE_MD1:-no}
-    if [[ "$RECREATE_MD1" == "yes" ]]; then
+    if [[ "$MODE" == "unattended" ]]; then
+        log_warn "Unattended: останавливаю существующий /dev/md1 без спроса"
         mdadm --stop /dev/md1 || true
     else
-        log_error "Невозможно продолжить с существующим /dev/md1"
-        exit 1
+        log_warn "Устройство /dev/md1 уже существует!"
+        read -rp "Пересоздать? (yes/no) [no]: " RECREATE_MD1
+        RECREATE_MD1=${RECREATE_MD1:-no}
+        if [[ "$RECREATE_MD1" == "yes" ]]; then
+            mdadm --stop /dev/md1 || true
+        else
+            log_error "Невозможно продолжить с существующим /dev/md1"
+            exit 1
+        fi
     fi
 fi
 
@@ -479,8 +546,8 @@ echo "==> Создание ext4 на /dev/md1 (root)"
 mkfs.ext4 -L "$ROOT_LABEL" /dev/md1
 
 echo "==> Создание FAT32 на ESP"
-mkfs.fat -F32 -n EFI_A "/dev/$PART1_1"
-mkfs.fat -F32 -n EFI_B "/dev/$PART2_1"
+mkfs.fat -F32 -n "$ESP_LABEL1" "/dev/$PART1_1"
+mkfs.fat -F32 -n "$ESP_LABEL2" "/dev/$PART2_1"
 
 # ==============================================================================
 # Шаг 7: Монтирование
@@ -488,8 +555,11 @@ mkfs.fat -F32 -n EFI_B "/dev/$PART2_1"
 log_step "Шаг 7: Монтирование"
 
 mount /dev/md1 /mnt
-mkdir -p /mnt/boot /mnt/boot/efi
+mkdir -p /mnt/boot
 mount /dev/md0 /mnt/boot
+# NB: /mnt/boot/efi создавать только ПОСЛЕ монтирования md0: маунт затеняет
+# всё, что было создано в /mnt/boot до него (баг: mount point does not exist).
+mkdir -p /mnt/boot/efi
 mount "/dev/$PART1_1" /mnt/boot/efi
 
 # ==============================================================================
@@ -575,10 +645,16 @@ if [[ "$MODE" == "unattended" ]]; then
     fi
 fi
 
-# Схема: актуальный ключ bootloader_config + устаревший bootloader рядом.
-# Почему оба: свежий archinstall читает bootloader_config (args.py), старый —
-# только bootloader (deprecated-фолбэк). Дублирование безвредно: новый приоритетно
-# берёт bootloader_config, старый игнорирует неизвестный ключ.
+# Схема silent-конфига: загрузчика от archinstall НЕТ вообще.
+# Почему: add_bootloader в archinstall 4.5 не детектит root на pre-mounted
+# mdraid (ValueError «Could not detect root at mountpoint /mnt», guided.py
+# вызывает add_bootloader всегда, когда bootloader != NO_BOOTLOADER).
+# Поэтому unattended ставит «No bootloader» + флаг --skip-boot, а rEFInd
+# целиком делает Фаза C (C.4 refind-install, C.5 драйвер, C.7 refind.conf).
+# Оба ключа (bootloader_config + устаревший bootloader) — со значением
+# «No bootloader»: свежий читает subdict (args.py: приоритет), старому
+# top-level нужен как фолбэк. Интерактивная ветка ниже — отдельно, там
+# предзаполнение Refind для ручного выбора в TUI.
 #
 # Остальные ключи silent-конфига — только с известной формой (man archinstall 2.6.0):
 # disk_config, hostname, kernels, packages, locale_config {kb_layout, sys_enc,
@@ -601,9 +677,9 @@ if [[ "$MODE" == "unattended" ]]; then
         "mountpoint": "/mnt"
     },
     "bootloader_config": {
-        "bootloader": "$BOOTLOADER_VALUE"
+        "bootloader": "No bootloader"
     },
-    "bootloader": "$BOOTLOADER_VALUE",
+    "bootloader": "No bootloader",
     "hostname": "$HOSTNAME",
     "kernels": ["$INSTALL_KERNEL"],
     "packages": $PKGS_JSON,
@@ -643,8 +719,11 @@ if [[ "$MODE" == "unattended" ]]; then
     log_step "Шаг 11: Запуск archinstall --silent"
 
     ARCHINSTALL_LOG="/tmp/archinstall-silent.log"
-    echo "==> archinstall --config $ARCHINSTALL_CONFIG --silent (лог: $ARCHINSTALL_LOG)"
-    if archinstall --config "$ARCHINSTALL_CONFIG" --silent >"$ARCHINSTALL_LOG" 2>&1; then
+    # --skip-ntp/--skip-wkd обязательны: archinstall бесконечно ждёт NTP-синхры
+    # и archlinux-keyring-wkd-sync.service БЕЗ таймаута (_verify_service_stop),
+    # а wkd-таймера на CachyOS ISO вообще нет → silent виснет навсегда.
+    echo "==> archinstall --config $ARCHINSTALL_CONFIG --silent --skip-ntp --skip-wkd --skip-boot (лог: $ARCHINSTALL_LOG)"
+    if archinstall --config "$ARCHINSTALL_CONFIG" --silent --skip-ntp --skip-wkd --skip-boot >"$ARCHINSTALL_LOG" 2>&1; then
         echo "==> Silent-установка завершена успешно"
     else
         INSTALLER_EXIT=$?
@@ -748,7 +827,11 @@ echo "==> Базовая система установлена — OK"
 log_step "Шаг 13: Фаза C — донастройка rEFInd/ESP + memtest86+ (chroot)"
 
 # Копируем скрипт для chroot
-cat > /mnt/tmp/chroot-setup.sh << 'CHROOT_EOF'
+# NB: кладём в /root, НЕ в /tmp: современный arch-chroot монтирует tmpfs
+# поверх $chroot/tmp (chroot_setup() в arch-install-scripts) — всё, что лежит
+# в /mnt/tmp, внутри chroot невидимо (прогон 6 упал с ENOENT именно на этом).
+mkdir -p /mnt/root
+cat > /mnt/root/chroot-setup.sh << 'CHROOT_EOF'
 #!/bin/bash
 set -euo pipefail
 
@@ -759,6 +842,23 @@ echo "==> [Фаза C] Донастройка rEFInd/ESP"
 #       Без mdadm система не соберёт RAID на загрузке = unbootable.
 #       --needed: не переустанавливать то что уже есть.
 # ------------------------------------------------------------------
+# C.0a: Репа CachyOS в таргете — нужна C.2b для linux-cachyos.
+#       archinstall мог не перенести [cachyos] из live-окружения в таргет,
+#       проверяем явно: без репы swap ядра упадёт «target not found».
+#       pacman-key --populate идемпотентен, повторный прогон безопасен.
+echo "==> C.0a: Проверка репы [cachyos] в таргете"
+if [[ ! -f /etc/pacman.d/cachyos-mirrorlist ]]; then
+    echo "    mirrorlist нет — ставлю cachyos-mirrorlist"
+    pacman -S --noconfirm --needed cachyos-mirrorlist
+fi
+if ! grep -q '^\[cachyos\]' /etc/pacman.conf; then
+    echo "    секции [cachyos] нет — дописываю в pacman.conf"
+    printf '\n[cachyos]\nInclude = /etc/pacman.d/cachyos-mirrorlist\n' >> /etc/pacman.conf
+fi
+pacman-key --init >/dev/null 2>&1 || true
+pacman-key --populate archlinux cachyos
+pacman -Sy
+
 echo "==> C.0: Доустановка пакетов в таргет"
 pacman -S --noconfirm --needed mdadm refind rsync efibootmgr gdisk dosfstools
 
@@ -796,6 +896,18 @@ if [[ "SWAP_KERNEL_PLACEHOLDER" == "1" ]]; then
         echo "    ОШИБКА: образ /boot/vmlinuz-KERNEL_PKG_PLACEHOLDER не появился" >&2
         exit 1
     fi
+fi
+
+# ------------------------------------------------------------------
+# C.2b-extra: Доп. пакеты к ядру из сценария (headers, LTS-ядро, драйвер).
+#       Независимо от SWAP: нужны и когда archinstall знал KERNEL_PKG
+#       (SWAP=0, ядро уже в таргете), и когда нет. Пустой список — пропуск.
+#       NB: nvidia-модуль держим здесь, а не в EXTRA_PKGS фазы B: он зависит
+#       от linux-cachyos=X.Y-Z, которого в фазе B ещё нет.
+# ------------------------------------------------------------------
+if [[ -n "KERNEL_EXTRA_PKGS_PLACEHOLDER" ]]; then
+    echo "==> C.2b-extra: Доустановка: KERNEL_EXTRA_PKGS_PLACEHOLDER"
+    pacman -S --noconfirm --needed KERNEL_EXTRA_PKGS_PLACEHOLDER
 fi
 
 # ------------------------------------------------------------------
@@ -940,12 +1052,12 @@ cat /etc/fstab | sed 's/^/      /'
 #       TUI-режим уже всё настроил сам — блок пропускается.
 #       Пароли живут только в этом файле (600) и затираются shred в конце.
 # ------------------------------------------------------------------
-if [[ -f /tmp/p510-scenario.env ]]; then
+if [[ -f /root/p510-scenario.env ]]; then
     echo "==> C.9: Локаль и пользователи из сценария"
-    chmod 600 /tmp/p510-scenario.env
+    chmod 600 /root/p510-scenario.env
     set -a
     # shellcheck disable=SC1090
-    source /tmp/p510-scenario.env
+    source /root/p510-scenario.env
     set +a
 
     ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
@@ -955,14 +1067,26 @@ if [[ -f /tmp/p510-scenario.env ]]; then
     echo "LANG=$LOCALE" > /etc/locale.conf
     echo "KEYMAP=$KEYMAP" > /etc/vconsole.conf
 
-    useradd -m -G wheel -s /bin/bash "$USERNAME"
+    if [[ ! -x "USER_SHELL_PLACEHOLDER" ]]; then
+        echo "    ОШИБКА: shell USER_SHELL_PLACEHOLDER отсутствует в таргете (нет пакета?)" >&2
+        exit 1
+    fi
+    useradd -m -G wheel -s "USER_SHELL_PLACEHOLDER" "$USERNAME"
     echo "$USERNAME:$USER_PASSWORD" | chpasswd
     echo "root:$ROOT_PASSWORD" | chpasswd
     echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/10-wheel
     chmod 440 /etc/sudoers.d/10-wheel
     systemctl enable NetworkManager
+    # Дисплей-менеджер CachyOS — plasmalogin (пакет plasma-login-manager).
+    # Не sddm: оба сервиса конфликтуют, включаем только при наличии.
+    if [[ -f /usr/lib/systemd/system/plasmalogin.service ]]; then
+        systemctl enable plasmalogin
+        echo "    plasmalogin (KDE) включён"
+    else
+        echo "    ВНИМАНИЕ: plasmalogin.service нет (KDE-набор не ставился?) — DM не включён"
+    fi
 
-    shred -u /tmp/p510-scenario.env
+    shred -u /root/p510-scenario.env
     echo "    Пользователь $USERNAME создан, сценарный файл затёрт"
 else
     echo "==> C.9: сценарного файла нет (TUI-режим) — пропускаю"
@@ -971,26 +1095,31 @@ fi
 echo "==> [Фаза C] Донастройка завершена"
 CHROOT_EOF
 
-chmod +x /mnt/tmp/chroot-setup.sh
+chmod +x /mnt/root/chroot-setup.sh
 
 # Подстановка переменных в chroot-скрипт
-sed -i "s|ESP_DEVICE_PLACEHOLDER|/dev/$PART1_1|g" /mnt/tmp/chroot-setup.sh
-sed -i "s|BOOT_LABEL_PLACEHOLDER|$BOOT_LABEL|g" /mnt/tmp/chroot-setup.sh
-sed -i "s|KERNEL_PKG_PLACEHOLDER|$KERNEL_PKG|g; s|SWAP_KERNEL_PLACEHOLDER|$SWAP_KERNEL|g" /mnt/tmp/chroot-setup.sh
+sed -i "s|ESP_DEVICE_PLACEHOLDER|/dev/$PART1_1|g" /mnt/root/chroot-setup.sh
+sed -i "s|BOOT_LABEL_PLACEHOLDER|$BOOT_LABEL|g" /mnt/root/chroot-setup.sh
+sed -i "s|KERNEL_PKG_PLACEHOLDER|$KERNEL_PKG|g; s|SWAP_KERNEL_PLACEHOLDER|$SWAP_KERNEL|g; s|USER_SHELL_PLACEHOLDER|$USER_SHELL|g; s|KERNEL_EXTRA_PKGS_PLACEHOLDER|$KERNEL_EXTRA_PKGS|g" /mnt/root/chroot-setup.sh
 
 # Сценарный файл — в таргет для блока C.9 (только unattended; в интерактиве
 # SCENARIO_FILE пуст и копировать нечего). Права 600 — там пароли.
 if [[ "$MODE" == "unattended" ]]; then
-    cp "$SCENARIO_FILE" /mnt/tmp/p510-scenario.env
-    chmod 600 /mnt/tmp/p510-scenario.env
+    cp "$SCENARIO_FILE" /mnt/root/p510-scenario.env
+    chmod 600 /mnt/root/p510-scenario.env
 fi
 
 # Выполнение chroot-скрипта
 echo "==> Запуск настройки в chroot"
-arch-chroot /mnt /bin/bash /tmp/chroot-setup.sh
+if [[ ! -x /mnt/root/chroot-setup.sh ]]; then
+    log_error "/mnt/root/chroot-setup.sh отсутствует — heredoc не записался?"
+    ls -la /mnt/root/ || true
+    exit 1
+fi
+arch-chroot /mnt /bin/bash /root/chroot-setup.sh
 
 # Блок C.9 затирает сценарный файл изнутри; это — страховка на случай обрыва.
-rm -f /mnt/tmp/p510-scenario.env
+rm -f /mnt/root/p510-scenario.env
 
 # ==============================================================================
 # ФАЗА D — Зеркалирование ESP + автохук
