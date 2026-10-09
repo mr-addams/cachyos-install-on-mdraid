@@ -33,6 +33,138 @@ log_error() {
 }
 
 # ==============================================================================
+# fix_md_superblock_compat — обнуляет logical_block_size в суперблоках md 1.x
+#   Аргументы: /dev/mdN:ВЕРСИЯ:/dev/член1:/dev/член2 (ВЕРСИЯ = 1.0 или 1.2)
+#
+# WHY: ядро >= 6.19 при создании массива пишет в суперблок поле logical_block_size
+#   (байты 224..227, раньше часть pad3). Ядро <= 6.18 (LTS 6.18) видит ненулевой
+#   pad3 и отвергает суперблок ("does not have a valid v1.x superblock"), а live-ISO
+#   на 7.x создаёт массивы именно в таком виде — LTS их не соберёт.
+#   Ядро 7.x при сборке выведет предупреждение про LBS — это ожидаемо.
+#   Побочный эффект: защита от смены размера логического блока отключена; для дисков
+#   512 Б смены не ожидается. Если поле уже 0 — Python-помощник пропускает члена.
+#
+# WHY udev-очередь остановлена: пока правим члены, udev по событию change вызвал бы
+#   mdadm -I и пересобрал массив посреди записи. Очередь возвращается при любом исходе.
+# ==============================================================================
+fix_md_superblock_compat() {
+    local rc=0 spec md ver member py_helper
+    local -a fields members py_args=()
+
+    py_helper=$(mktemp)
+    cat > "$py_helper" << 'MDSB_PY_EOF'
+#!/usr/bin/env python3
+import os, struct, sys
+
+MAGIC = 0xa92b4efc
+CSUM_OFF = 216
+MAXDEV_OFF = 220
+LBS_OFF = 224          # logical_block_size (ядро >= 6.19), раньше pad3[0:4]
+PAD_REST = (228, 256)  # остаток pad3: должен быть нулевым, иначе это неизвестная фича — не трогаем
+
+
+def sb_offset(dev, ver):
+    sectors = int(open('/sys/class/block/%s/size' % os.path.basename(dev)).read())
+    if ver == '1.0':
+        return ((sectors - 16) & ~7) * 512
+    if ver == '1.2':
+        return 8 * 512
+    raise SystemExit('%s: неподдерживаемая версия метаданных %s' % (dev, ver))
+
+
+def calc_csum(buf, max_dev):
+    size = 256 + max_dev * 2
+    total = 0
+    for i in range(size // 4):
+        if i * 4 == CSUM_OFF:
+            continue
+        total += struct.unpack_from('<I', buf, i * 4)[0]
+    if size % 4 == 2:
+        total += struct.unpack_from('<H', buf, (size // 4) * 4)[0]
+    return ((total & 0xffffffff) + (total >> 32)) & 0xffffffff
+
+
+def patch(dev, ver):
+    off = sb_offset(dev, ver)
+    fd = os.open(dev, os.O_RDWR | os.O_DSYNC)
+    try:
+        buf = bytearray(os.pread(fd, 4096, off))
+        magic, major = struct.unpack_from('<II', buf, 0)
+        if magic != MAGIC or major != 1:
+            raise SystemExit('%s: не суперблок md 1.x по смещению %d' % (dev, off))
+        max_dev = struct.unpack_from('<I', buf, MAXDEV_OFF)[0]
+        if max_dev > 1920:
+            raise SystemExit('%s: max_dev=%d вне допустимого' % (dev, max_dev))
+        stored = struct.unpack_from('<I', buf, CSUM_OFF)[0]
+        if calc_csum(buf, max_dev) != stored:
+            raise SystemExit('%s: контрольная сумма не сходится ДО правки — не трогаю' % dev)
+        if any(buf[PAD_REST[0]:PAD_REST[1]]) or struct.unpack_from('<I', buf, 12)[0]:
+            raise SystemExit('%s: ненулевой pad вне logical_block_size — неизвестная фича, не трогаю' % dev)
+        if struct.unpack_from('<I', buf, LBS_OFF)[0] == 0:
+            print('%s: logical_block_size уже 0 — пропуск' % dev)
+            return
+        struct.pack_into('<I', buf, LBS_OFF, 0)
+        struct.pack_into('<I', buf, CSUM_OFF, calc_csum(buf, max_dev))
+        os.pwrite(fd, bytes(buf[:512]), off)
+        os.fsync(fd)
+        chk = bytearray(os.pread(fd, 4096, off))
+        if struct.unpack_from('<I', chk, LBS_OFF)[0] != 0 or \
+           calc_csum(chk, max_dev) != struct.unpack_from('<I', chk, CSUM_OFF)[0]:
+            raise SystemExit('%s: проверка после записи не прошла' % dev)
+        print('%s: logical_block_size обнулён, контрольная сумма пересчитана' % dev)
+    finally:
+        os.close(fd)
+
+
+for spec in sys.argv[1:]:
+    dev, ver = spec.split(':')
+    patch(dev, ver)
+MDSB_PY_EOF
+
+    udevadm control --stop-exec-queue
+
+    # WHY stop без udev: очередь уже остановлена, mdadm иначе ждёт udev и зависает.
+    for spec in "$@"; do
+        IFS=: read -r -a fields <<< "$spec"
+        md=${fields[0]}
+        if ! MDADM_NO_UDEV=1 mdadm --stop "$md"; then
+            log_error "Не удалось остановить $md"
+            rc=1
+        fi
+    done
+
+    # WHY патч только при успешной остановке: правка члена активного массива
+    # портит данные, которые ядро держит в памяти.
+    if [[ $rc -eq 0 ]]; then
+        for spec in "$@"; do
+            IFS=: read -r -a fields <<< "$spec"
+            ver=${fields[1]}
+            for member in "${fields[@]:2}"; do
+                py_args+=("$member:$ver")
+            done
+        done
+        python3 "$py_helper" "${py_args[@]}" || rc=1
+    fi
+
+    # WHY пересборка всегда, даже при rc!=0: иначе скрипт оставит массивы остановленными.
+    for spec in "$@"; do
+        IFS=: read -r -a fields <<< "$spec"
+        md=${fields[0]}
+        members=("${fields[@]:2}")
+        MDADM_NO_UDEV=1 mdadm --assemble "$md" "${members[@]}" || rc=1
+    done
+
+    udevadm control --start-exec-queue || rc=1
+    udevadm settle || rc=1
+    rm -f "$py_helper"
+
+    if [[ $rc -ne 0 ]]; then
+        log_error "fix_md_superblock_compat: сбой правки суперблоков или пересборки массивов"
+        exit 1
+    fi
+}
+
+# ==============================================================================
 # Режимы работы (инвариант: оба запускаются по SSH)
 #   Интерактив (дефолт): опрос + TUI фазы B. Нужен TTY (ssh -t; boot.sh
 #     перецепляет stdin с pipe на /dev/tty).
@@ -521,6 +653,9 @@ echo "==> Создание /dev/md1 (root, metadata=1.2)"
 mdadm --create /dev/md1 --run --level=1 --raid-devices=2 \
       --metadata=1.2 "/dev/$PART1_3" "/dev/$PART2_3"
 
+# WHY сразу после create, до mkfs: иначе LTS-ядро не соберёт массивы при загрузке.
+fix_md_superblock_compat "/dev/md0:1.0:/dev/$PART1_2:/dev/$PART2_2" "/dev/md1:1.2:/dev/$PART1_3:/dev/$PART2_3"
+
 udevadm settle
 for md in /dev/md0 /dev/md1; do
     if [[ ! -b "$md" ]]; then
@@ -859,26 +994,110 @@ pacman-key --init >/dev/null 2>&1 || true
 pacman-key --populate archlinux cachyos
 pacman -Sy
 
+# CachyOS заменяет zlib на zlib-ng-compat (в их репозитории Replaces: zlib, для lib32 то же),
+# и пакеты репозитория (wine-cachyos, proton-cachyos, steam-обвязка) собраны под него.
+# archinstall ставит базу с zlib из core; при pacman -S без полного апгрейда «замены» не
+# срабатывают, а на вопрос о конфликте при --noconfirm по умолчанию «нет» — игровой набор
+# падал с "zlib-ng-compat and zlib are in conflict". Меняем явно: --ask 4 = «да» на
+# удаление конфликтующего пакета (поставщик libz.so остаётся — zlib-ng-compat provides zlib).
+echo "==> C.0a: zlib -> zlib-ng-compat (как в штатной CachyOS)"
+pacman -S --noconfirm --ask 4 --needed zlib-ng-compat lib32-zlib-ng-compat
+
 echo "==> C.0: Доустановка пакетов в таргет"
 pacman -S --noconfirm --needed mdadm refind rsync efibootmgr gdisk dosfstools
 
 # ------------------------------------------------------------------
 # C.1: Перезаписать /etc/mdadm.conf (архинсталл мог написать некорректно
 #       из-за "too complicated to detect" для RAID)
+#       HOMEHOST <ignore> первой строкой: массивы созданы в live-окружении с его
+#       hostname, а в initramfs и установленной системе hostname другой. Без
+#       этой строки udev считает массивы чужими, root по UUID не находится и
+#       загрузка падает в emergency shell. Файл перезаписывается целиком, поэтому
+#       повторный запуск не плодит дубли ARRAY-строк.
+#       MAILADDR root: без MAILADDR или PROGRAM mdmonitor при каждой загрузке падает
+#       с "No mail address or alert command - not monitoring" и висит в systemctl --failed.
 # ------------------------------------------------------------------
 echo "==> C.1: Перезапись /etc/mdadm.conf"
-mdadm --detail --scan > /etc/mdadm.conf
+{
+    echo "HOMEHOST <ignore>"
+    echo "MAILADDR root"
+    mdadm --detail --scan
+} > /etc/mdadm.conf
 
 # ------------------------------------------------------------------
-# C.2: Проверить/добавить mdadm_udev в HOOKS mkinitcpio.conf
-#       Идемпотентно: grep перед sed, не задублировать при повторном запуске
+# C.2: Проверить/добавить mdadm_udev и mdrun в HOOKS mkinitcpio.conf
+#       Идемпотентно: каждое слово ищем именно в строке HOOKS (не во всём файле),
+#       иначе совпадение в комментарии сочтём за «уже добавлено».
+#       Итог: block mdadm_udev mdrun filesystems — mdrun обязан идти после udev.
 # ------------------------------------------------------------------
 echo "==> C.2: Проверка mdadm_udev в HOOKS"
-if ! grep -q "mdadm_udev" /etc/mkinitcpio.conf; then
+if ! grep '^HOOKS=' /etc/mkinitcpio.conf | grep -qw mdadm_udev; then
     sed -i 's/^HOOKS=(\(.*\)filesystems/HOOKS=(\1 mdadm_udev filesystems/' /etc/mkinitcpio.conf
     echo "    mdadm_udev добавлен в HOOKS"
 else
     echo "    mdadm_udev уже есть в HOOKS — OK"
+fi
+
+# ------------------------------------------------------------------
+# C.2a: Свой initcpio-хук mdrun — запуск degraded-массивов при загрузке
+#       mdadm_udev собирает массив только когда пришли ВСЕ члены. При мёртвом
+#       или отключённом диске RAID1 остаётся inactive, и root не находится —
+#       ради этого зеркало и затевалось. Хук ставим после udev, чтобы он видел
+#       уже собранные полным набором массивы.
+# ------------------------------------------------------------------
+echo "==> C.2a: Установка хука mdrun"
+mkdir -p /etc/initcpio/install /etc/initcpio/hooks
+
+cat > /etc/initcpio/install/mdrun << 'MDRUN_INSTALL_EOF'
+#!/bin/bash
+build() {
+    add_binary mdadm
+    add_runscript
+}
+help() {
+    echo "Запускает неполностью собранные (degraded) md-массивы, оставленные udev в inactive."
+}
+MDRUN_INSTALL_EOF
+chmod 755 /etc/initcpio/install/mdrun
+
+cat > /etc/initcpio/hooks/mdrun << 'MDRUN_HOOK_EOF'
+#!/usr/bin/ash
+run_hook() {
+    # run_hook идёт после udev-хука: тот уже сделал udevadm settle, массивы
+    # с полным набором членов уже active. Ждём до 5 с только если есть inactive:
+    # второй диск может подняться чуть позже, и форсировать degraded раньше
+    # времени значило бы получить лишний ресинк.
+    i=0
+    while [ "$i" -lt 5 ]; do
+        need=0
+        for md in /sys/block/md*; do
+            [ -r "$md/md/array_state" ] || continue
+            read -r state < "$md/md/array_state"
+            [ "$state" = "inactive" ] && need=1
+        done
+        [ "$need" -eq 0 ] && return 0
+        sleep 1
+        i=$((i + 1))
+    done
+    for md in /sys/block/md*; do
+        [ -r "$md/md/array_state" ] || continue
+        read -r state < "$md/md/array_state"
+        if [ "$state" = "inactive" ]; then
+            msg ":: mdrun: запуск degraded-массива ${md##*/}"
+            mdadm --run "/dev/${md##*/}" || true
+        fi
+    done
+    udevadm settle
+}
+MDRUN_HOOK_EOF
+chmod 755 /etc/initcpio/hooks/mdrun
+
+# mdrun — отдельной проверкой и вставкой перед filesystems, после mdadm_udev
+if ! grep '^HOOKS=' /etc/mkinitcpio.conf | grep -qw mdrun; then
+    sed -i 's/^HOOKS=(\(.*\)filesystems/HOOKS=(\1 mdrun filesystems/' /etc/mkinitcpio.conf
+    echo "    mdrun добавлен в HOOKS"
+else
+    echo "    mdrun уже есть в HOOKS — OK"
 fi
 
 # ------------------------------------------------------------------
@@ -911,6 +1130,30 @@ if [[ -n "KERNEL_EXTRA_PKGS_PLACEHOLDER" ]]; then
 fi
 
 # ------------------------------------------------------------------
+# C.2c: Plymouth-сплэш CachyOS. Без темы plymouth показывает стандартный логотип Arch.
+#       Тема cachyos-bootanimation поставляется пакетом cachyos-plymouth-bootanimation.
+#       WHY без -R в plymouth-set-default-theme: initramfs всё равно пересобирается
+#       в C.3, отдельная пересборка здесь лишняя.
+#       WHY хук сразу после udev: plymouth выбирает DRM-устройство через udev;
+#       хук стоит раньше mdadm_udev/mdrun, чтобы сплэш появился до ожидания массивов.
+#       Параметр quiet splash в refind.conf уже задан — здесь его не трогаем.
+# ------------------------------------------------------------------
+echo "==> C.2c: Plymouth-сплэш CachyOS"
+pacman -S --noconfirm --needed plymouth cachyos-plymouth-bootanimation
+plymouth-set-default-theme cachyos-bootanimation
+if ! grep -q '^Theme=cachyos-bootanimation' /etc/plymouth/plymouthd.conf; then
+    echo "    ОШИБКА: тема cachyos-bootanimation не выставлена в /etc/plymouth/plymouthd.conf" >&2
+    exit 1
+fi
+# \budev\b: без границ слова заденет mdadm_udev (\b не срабатывает на '_' внутри слова)
+if ! grep '^HOOKS=' /etc/mkinitcpio.conf | grep -qw plymouth; then
+    sed -i '/^HOOKS=/ s/\budev\b/udev plymouth/' /etc/mkinitcpio.conf
+    echo "    plymouth добавлен в HOOKS"
+else
+    echo "    plymouth уже есть в HOOKS — OK"
+fi
+
+# ------------------------------------------------------------------
 # C.3: Пересборка initramfs
 # ------------------------------------------------------------------
 echo "==> C.3: mkinitcpio -P"
@@ -922,11 +1165,23 @@ mkinitcpio -P
 #       Если "No Bootloader" — устанавливаем через refind-install.
 # ------------------------------------------------------------------
 echo "==> C.4: Проверка/установка rEFInd"
+REFIND_USEDEFAULT=0
 if [[ ! -d /boot/efi/EFI/refind ]]; then
-    echo "    rEFInd не найден — устанавливаем через refind-install"
+    echo "    rEFInd не найден — устанавливаем через refind-install --usedefault"
     refind-install --usedefault "ESP_DEVICE_PLACEHOLDER"
+    REFIND_USEDEFAULT=1
 else
     echo "    rEFInd уже установлен — дополняем конфиг"
+fi
+
+# Каталог, откуда rEFInd читает refind.conf и грузит drivers_x64, зависит от режима
+# установки. --usedefault кладёт бинарь в EFI/BOOT/bootx64.efi (fallback-путь прошивки)
+# и не трогает NVRAM, поэтому конфиг и драйверы должны лежать рядом с ним. Если rEFInd
+# уже стоит от инсталлятора (EFI/refind есть), он работает из EFI/refind с NVRAM-записью.
+if (( REFIND_USEDEFAULT )); then
+    REFIND_DIR=/boot/efi/EFI/BOOT
+else
+    REFIND_DIR=/boot/efi/EFI/refind
 fi
 
 # ------------------------------------------------------------------
@@ -935,10 +1190,10 @@ fi
 #       т.к. /boot на mdraid RAID1, не на ESP
 # ------------------------------------------------------------------
 echo "==> C.5: Установка ext4-драйвера"
-mkdir -p /boot/efi/EFI/refind/drivers_x64
+mkdir -p "$REFIND_DIR/drivers_x64"
 EXT4_DRIVER=$(pacman -Ql refind | grep ext4_x64.efi | awk '{print $2}')
 if [[ -n "$EXT4_DRIVER" ]]; then
-    cp "$EXT4_DRIVER" /boot/efi/EFI/refind/drivers_x64/
+    cp "$EXT4_DRIVER" "$REFIND_DIR/drivers_x64/"
     echo "    ext4_x64.efi скопирован"
 else
     echo "    ОШИБКА: ext4_x64.efi не найден в пакете refind!"
@@ -957,7 +1212,10 @@ fi
 echo "==> C.6: Установка memtest86+ (EFI)"
 if pacman -S --noconfirm memtest86+-efi; then
     # Определяем фактический путь .efi-бинаря (структура каталогов меняется между версиями)
-    MEMTEST_EFI=$(pacman -Ql memtest86+-efi | awk '{print $2}' | grep -E '\.efi$' | head -n1)
+    # Пакет кладёт ДВА бинаря: memtest86ia32.efi и memtest86x64.efi. Нужен x64: rEFInd
+    # проверяет в PE-заголовке тип машины и 32-битный отвергает ("invalid loader file"),
+    # а прежний `head -n1` по алфавиту брал именно ia32 — плитки memtest в меню не было.
+    MEMTEST_EFI=$(pacman -Ql memtest86+-efi | awk '{print $2}' | grep -E '/memtest86x64\.efi$' | head -n1)
     if [[ -n "$MEMTEST_EFI" ]]; then
         mkdir -p /boot/efi/EFI/tools
         cp "$MEMTEST_EFI" /boot/efi/EFI/tools/memtest86.efi
@@ -976,7 +1234,7 @@ fi
 #       volume — метка /boot (BOOT_LABEL), rEFInd видит её как UEFI-том
 #       благодаря ext4-драйверу, независимо от того, что это mdraid
 # ------------------------------------------------------------------
-echo "==> C.7: Генерация /boot/efi/EFI/refind/refind.conf"
+echo "==> C.7: Генерация $REFIND_DIR/refind.conf"
 ROOT_UUID=$(blkid -s UUID -o value /dev/md1)
 # Образ ядра — не хардкод: silent с откатом ставит linux, интерактив — что
 # выбрал пользователь в TUI. Приоритет запрошенному пакету, иначе первый образ.
@@ -997,9 +1255,27 @@ if [[ ! -f "/boot/$INITRD" ]]; then
     exit 1
 fi
 echo "    Ядро для стансы: /$KIMG + /$INITRD"
-cat > /boot/efi/EFI/refind/refind.conf << REFIND_CONF_EOF
-menuentry "CachyOS" {
-    icon     /EFI/refind/icons/os_arch.png
+# Stock refind.conf от refind-install затирается нашим — сохраняем оригинал один раз,
+# чтобы при сравнении или откате было с чем сверяться. Не перезаписываем старый .orig,
+# иначе повторный запуск подменил бы настоящий оригинал нашим конфигом.
+if [[ -f "$REFIND_DIR/refind.conf" && ! -f "$REFIND_DIR/refind.conf.orig" ]]; then
+    cp "$REFIND_DIR/refind.conf" "$REFIND_DIR/refind.conf.orig"
+fi
+# Путь иконки — относительно ESP, поэтому берём его от реального каталога rEFInd.
+REFIND_ICON_PREFIX=${REFIND_DIR#/boot/efi}
+# default_selection по названию записи: без него rEFInd берёт первым самый свежий
+# файл ядра и грузит LTS вместо основного. Название намеренно уникальное: rEFInd
+# ищет подстроку без учёта регистра, а у автозаписей в названии есть «cachyos»
+# (vmlinuz-linux-cachyos-lts) — короткое «CachyOS» выбрало бы LTS снова.
+# scanfor manual: автоскан находит ядра в /boot, но без refind_linux.conf у них нет
+# root= — такие записи уходят в emergency shell. Оставляем только ручные записи;
+# ряд инструментов (memtest86 и т.д.) от scanfor не зависит.
+cat > "$REFIND_DIR/refind.conf" << REFIND_CONF_EOF
+timeout 5
+default_selection "CachyOS RAID1 main"
+scanfor manual
+menuentry "CachyOS RAID1 main" {
+    icon     ${REFIND_ICON_PREFIX}/icons/os_arch.png
     volume   "BOOT_LABEL_PLACEHOLDER"
     loader   /$KIMG
     initrd   /$INITRD
@@ -1041,7 +1317,23 @@ ensure_fstab_entry() {
 
 ensure_fstab_entry /dev/md1 / ext4 "rw,relatime" "0 1"
 ensure_fstab_entry /dev/md0 /boot ext4 "rw,relatime" "0 2"
-ensure_fstab_entry ESP_DEVICE_PLACEHOLDER /boot/efi vfat "rw,relatime,fmask=0022,dmask=0022,codepage=437,iocharset=ascii,shortname=mixed,utf8,errors=remount-ro" "0 2"
+ensure_fstab_entry ESP_DEVICE_PLACEHOLDER /boot/efi vfat "rw,relatime,fmask=0022,dmask=0022,codepage=437,iocharset=ascii,shortname=mixed,utf8,errors=remount-ro,nofail,x-systemd.device-timeout=5s" "0 2"
+
+# Нормализация записи /boot/efi. archinstall/genfstab пишет её без nofail, а
+# ensure_fstab_entry существующие строки не меняет. Без nofail отказ диска с этим ESP
+# валит local-fs.target и загрузка уходит в emergency mode, несмотря на RAID1 для ESP.
+# device-timeout ограничивает ожидание устройства, иначе systemd ждёт стандартные 90 с.
+# Идемпотентно: строки, где nofail уже есть, не трогаем. Бэкап fstab сделан выше.
+read -r efi_fstab_ok efi_fstab_bad <<< "$(awk '$2=="/boot/efi" { if ($4 ~ /(^|,)nofail(,|$)/) ok++; else bad++ } END { print ok+0, bad+0 }' /etc/fstab)"
+if [[ "$efi_fstab_bad" -gt 0 ]]; then
+    awk 'BEGIN { OFS="\t" } $2=="/boot/efi" && $4 !~ /(^|,)nofail(,|$)/ { $4=$4",nofail,x-systemd.device-timeout=5s" } { print }' /etc/fstab > /etc/fstab.normalized
+    cat /etc/fstab.normalized > /etc/fstab && rm -f /etc/fstab.normalized
+    echo "    /boot/efi нормализована: добавлены nofail,x-systemd.device-timeout=5s"
+elif [[ "$efi_fstab_ok" -gt 0 ]]; then
+    echo "    /boot/efi уже с nofail — OK"
+else
+    echo "    ВНИМАНИЕ: в fstab нет записи /boot/efi — нормализация пропущена"
+fi
 
 echo "    Итоговый fstab:"
 cat /etc/fstab | sed 's/^/      /'
@@ -1063,9 +1355,123 @@ if [[ -f /root/p510-scenario.env ]]; then
     ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
     hwclock --systohc || true
     sed -i "s/^#\(${LOCALE%%.*}.*UTF-8\)/\1/" /etc/locale.gen
+    # Системные локали: en_US, ru_RU, uk_UA (все UTF-8); LANG по умолчанию — $LOCALE (en_US.UTF-8).
+    # WHY: ru/uk нужны для русскоязычных/украинских приложений и данных, а системный язык
+    # оставляем английским, чтобы логи и сообщения утилит были единообразными.
+    LOCALES=${LOCALES:-en_US.UTF-8 ru_RU.UTF-8 uk_UA.UTF-8}
+    for loc in $LOCALES; do
+        sed -i -E "s/^#\s*(${loc//./\\.} UTF-8)/\1/" /etc/locale.gen
+    done
     locale-gen || echo "    ВНИМАНИЕ: locale-gen с ошибками — проверьте /etc/locale.gen"
     echo "LANG=$LOCALE" > /etc/locale.conf
     echo "KEYMAP=$KEYMAP" > /etc/vconsole.conf
+    # Раскладки: us, ru, ua; переключение Ctrl+Shift по кругу (XKB-опция grp:ctrl_shift_toggle).
+    # WHY до useradd: kxkbrc кладём в /etc/skel, а useradd -m копирует skel только при создании
+    # пользователя; X11-конфиг — системные раскладки для сеанса/экрана входа.
+    # Консоль (vconsole) остаётся на KEYMAP=$KEYMAP: переключение по кругу есть только в графике.
+    KB_LAYOUTS=${KB_LAYOUTS:-us,ru,ua}
+    KB_OPTIONS=${KB_OPTIONS:-grp:ctrl_shift_toggle}
+    install -d /etc/X11/xorg.conf.d
+    cat > /etc/X11/xorg.conf.d/00-keyboard.conf << KB_X11_EOF
+Section "InputClass"
+    Identifier "system-keyboard"
+    MatchIsKeyboard "on"
+    Option "XkbLayout" "$KB_LAYOUTS"
+    Option "XkbModel" "pc105"
+    Option "XkbOptions" "$KB_OPTIONS"
+EndSection
+KB_X11_EOF
+    install -d /etc/skel/.config
+    cat > /etc/skel/.config/kxkbrc << KB_KDE_EOF
+[Layout]
+LayoutList=$KB_LAYOUTS
+LayoutLoopCount=-1
+Model=pc105
+Options=$KB_OPTIONS
+ResetOldOptions=true
+SwitchMode=Global
+Use=true
+KB_KDE_EOF
+
+    # Энергопитание: экран блокируется через 15 мин, монитор гаснет через 30 мин, сон отключён.
+    # WHY: хост держит LXC-контейнеры с AI и доступен по SSH — уснувшая машина обрывает и то и другое.
+    # Затемнение выключено, чтобы оно не срабатывало раньше блокировки. TurnOffDisplayIdleTimeoutWhenLockedSec
+    # задан явно: по умолчанию заблокированный экран гаснет через 60 с, а не через заданные 30 мин.
+    # Ключи сверены со схемой powerdevil 6.7.5; Timeout в kscreenlockerrc — в минутах, в powerdevilrc — в секундах.
+    cat > /etc/skel/.config/kscreenlockerrc << 'SKEL_LOCK_EOF'
+[Daemon]
+Autolock=true
+Timeout=15
+SKEL_LOCK_EOF
+    : > /etc/skel/.config/powerdevilrc
+    for power_profile in AC Battery LowBattery; do
+        cat >> /etc/skel/.config/powerdevilrc << SKEL_POWER_EOF
+[$power_profile][Display]
+DimDisplayWhenIdle=false
+TurnOffDisplayIdleTimeoutSec=1800
+TurnOffDisplayIdleTimeoutWhenLockedSec=1800
+TurnOffDisplayWhenIdle=true
+
+[$power_profile][SuspendAndShutdown]
+AutoSuspendAction=0
+
+SKEL_POWER_EOF
+    done
+    # Страховка на уровне системы: маскировка гасит сон и из меню, и для других пользователей/greeter.
+    systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+
+    # Первый вход в KDE: панель Plasma вверху экрана; часы в панели — 24 ч, секунды, дата «Oct 09 2026».
+    # WHY одноразовый автозапуск, а не копия plasma-org.kde.plasma.desktop-appletsrc: готовый файл
+    # привязан к машине (UUID активности, номера экранов, ScreenMapping) и ломает рабочий стол нового
+    # пользователя, а при первом запуске Plasma сама создаёт раскладку по умолчанию (панель внизу).
+    # Скрипт ждёт появления панели, меняет настройки через скриптовый интерфейс plasmashell и убирает
+    # себя из автозапуска. Ключи часов: use24hFormat 0/1/2 = 12 ч/по региону/24 ч, showSeconds 0/1/2 =
+    # никогда/в подсказке/всегда (схема applets/digital-clock/main.xml в plasma-workspace).
+    install -d /etc/skel/.config/autostart
+    cat > /usr/local/bin/p510-plasma-first-login << 'PLASMA_FIRST_LOGIN_EOF'
+#!/bin/bash
+# Первый вход в KDE: панель Plasma наверх, часы в панели — 24 ч с секундами и датой «Oct 09 2026»;
+# затем убирает себя из автозапуска.
+set -u
+qdbus_bin=$(command -v qdbus6 || command -v qdbus-qt6 || true)
+[[ -n "$qdbus_bin" ]] || exit 0
+plasma_script='
+var ps = panels();
+for (var i = 0; i < ps.length; i++) {
+    var p = ps[i];
+    p.location = "top";
+    var ids = p.widgetIds;
+    for (var j = 0; j < ids.length; j++) {
+        var w = p.widgetById(ids[j]);
+        if (w.type == "org.kde.plasma.digitalclock") {
+            w.currentConfigGroup = ["Appearance"];
+            w.writeConfig("use24hFormat", 2);
+            w.writeConfig("showSeconds", 2);
+            w.writeConfig("showDate", true);
+            w.writeConfig("dateFormat", "custom");
+            w.writeConfig("customDateFormat", "MMM dd yyyy");
+            w.reloadConfig();
+        }
+    }
+}'
+for _ in $(seq 1 60); do
+    panel_count=$("$qdbus_bin" org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript 'print(panels().length)' 2>/dev/null || true)
+    if [[ "$panel_count" =~ ^[1-9][0-9]*$ ]]; then
+        "$qdbus_bin" org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "$plasma_script" >/dev/null 2>&1
+        rm -f "$HOME/.config/autostart/p510-plasma-first-login.desktop"
+        exit 0
+    fi
+    sleep 1
+done
+PLASMA_FIRST_LOGIN_EOF
+    chmod 755 /usr/local/bin/p510-plasma-first-login
+    cat > /etc/skel/.config/autostart/p510-plasma-first-login.desktop << 'PLASMA_FIRST_LOGIN_DESKTOP_EOF'
+[Desktop Entry]
+Type=Application
+Name=Plasma first-login tweaks (panel on top, 24h clock)
+Exec=/usr/local/bin/p510-plasma-first-login
+OnlyShowIn=KDE;
+PLASMA_FIRST_LOGIN_DESKTOP_EOF
 
     if [[ ! -x "USER_SHELL_PLACEHOLDER" ]]; then
         echo "    ОШИБКА: shell USER_SHELL_PLACEHOLDER отсутствует в таргете (нет пакета?)" >&2
@@ -1074,9 +1480,36 @@ if [[ -f /root/p510-scenario.env ]]; then
     useradd -m -G wheel -s "USER_SHELL_PLACEHOLDER" "$USERNAME"
     echo "$USERNAME:$USER_PASSWORD" | chpasswd
     echo "root:$ROOT_PASSWORD" | chpasswd
+
+    # Без ~/.p10k.zsh первый запуск терминала открывает мастер Powerlevel10k.
+    # Только zsh: штатный установщик CachyOS по умолчанию ставит fish, там p10k не нужен.
+    if [[ "USER_SHELL_PLACEHOLDER" == */zsh ]]; then
+        if [[ -f /root/p10k.zsh ]]; then
+            SRC=/root/p10k.zsh
+        elif [[ -f /usr/share/zsh-theme-powerlevel10k/config/p10k-rainbow.zsh ]]; then
+            SRC=/usr/share/zsh-theme-powerlevel10k/config/p10k-rainbow.zsh
+        else
+            SRC=""
+            echo "    ВНИМАНИЕ: нет ни /root/p10k.zsh, ни штатного пресета p10k — мастер откроется при первом запуске"
+        fi
+        if [[ -n "$SRC" ]]; then
+            install -o "$USERNAME" -g "$USERNAME" -m 644 "$SRC" "/home/$USERNAME/.p10k.zsh"
+            echo "    p10k: конфиг из $SRC → /home/$USERNAME/.p10k.zsh"
+        fi
+    fi
+    rm -f /root/p10k.zsh
+
     echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/10-wheel
     chmod 440 /etc/sudoers.d/10-wheel
     systemctl enable NetworkManager
+    # sshd нужен, чтобы стенд был доступен удалённо: без него после установки
+    # проверить его можно только с консоли. Пакет openssh входит в набор сценария.
+    if [[ -f /usr/lib/systemd/system/sshd.service ]]; then
+        systemctl enable sshd
+        echo "    sshd включён"
+    else
+        echo "    sshd.service нет (openssh не ставился?) — пропускаю"
+    fi
     # Дисплей-менеджер CachyOS — plasmalogin (пакет plasma-login-manager).
     # Не sddm: оба сервиса конфликтуют, включаем только при наличии.
     if [[ -f /usr/lib/systemd/system/plasmalogin.service ]]; then
@@ -1091,6 +1524,117 @@ if [[ -f /root/p510-scenario.env ]]; then
 else
     echo "==> C.9: сценарного файла нет (TUI-режим) — пропускаю"
 fi
+
+# ------------------------------------------------------------------
+# C.10: Утилиты + LXC с пробросом NVIDIA GPU (контейнеры для AI)
+#       Выполняется в обоих режимах (не зависит от сценария).
+#       WHY непривилегированные контейнеры по умолчанию: официальный хук LXC для NVIDIA
+#       (/usr/share/lxc/hooks/nvidia, через libnvidia-container) работает ТОЛЬКО в userns;
+#       он же пробрасывает /dev/nvidia*, libcuda и nvidia-smi ровно хостовой версии,
+#       так что в контейнере драйвер ставить не нужно.
+# ------------------------------------------------------------------
+echo "==> C.10: Утилиты и LXC"
+pacman -S --noconfirm --needed mc htop btop duf gdu lxc lxcfs libnvidia-container dnsmasq rsync wget gnupg xz squashfs-tools
+
+# Игровой набор — ровно то, что ставит кнопка «Install gaming» в CachyOS Hello (Welcome):
+# cachyos-gaming-meta (proton-cachyos, wine-cachyos, umu, lib32-библиотеки) и
+# cachyos-gaming-applications (steam, lutris, heroic, gamescope, mangohud...).
+# WHY после драйвера NVIDIA (C.2b-extra): lib32-nvidia-utils уже стоит и закрывает
+# зависимость lib32-vulkan-driver — иначе pacman --noconfirm выберет первый попавшийся
+# провайдер (например, radeon/intel). Около 2 ГиБ загрузки; отключается INSTALL_GAMING=no.
+if [[ "${INSTALL_GAMING:-yes}" == "yes" ]]; then
+    pacman -S --noconfirm --needed cachyos-gaming-meta cachyos-gaming-applications
+else
+    echo "    INSTALL_GAMING=no — игровой набор пропущен"
+fi
+
+# subuid/subgid для root: диапазон 1000000-1065535 (у обычного пользователя useradd даёт 100000+)
+for idmap_file in /etc/subuid /etc/subgid; do
+    grep -q '^root:' "$idmap_file" 2>/dev/null || echo "root:1000000:65536" >> "$idmap_file"
+done
+
+install -d /etc/lxc /etc/lxc/profiles
+cat > /etc/lxc/default.conf << 'LXC_DEFAULT_EOF'
+# Сеть: veth в мост lxcbr0 (его поднимает lxc-net.service, DHCP/DNS через dnsmasq)
+lxc.net.0.type = veth
+lxc.net.0.link = lxcbr0
+lxc.net.0.flags = up
+lxc.net.0.hwaddr = 10:66:6a:xx:xx:xx
+# Все новые контейнеры непривилегированные: uid/gid 0 внутри = 1000000 на хосте.
+# Обязательное условие для NVIDIA-хука LXC (он работает только в userns).
+lxc.idmap = u 0 1000000 65536
+lxc.idmap = g 0 1000000 65536
+LXC_DEFAULT_EOF
+
+# Штатный /etc/default/lxc ставит USE_LXC_BRIDGE=false и перебивает дефолт скрипта lxc-net,
+# поэтому мост включаем явно отдельным файлом (без него lxcbr0 не создаётся, сервис «active»).
+cat > /etc/default/lxc-net << 'LXC_NET_EOF'
+USE_LXC_BRIDGE="true"
+LXC_BRIDGE="lxcbr0"
+LXC_ADDR="10.0.3.1"
+LXC_NETMASK="255.255.255.0"
+LXC_NETWORK="10.0.3.0/24"
+LXC_DHCP_RANGE="10.0.3.2,10.0.3.254"
+LXC_DHCP_MAX="253"
+LXC_NET_EOF
+
+cat > /etc/lxc/profiles/gpu-nvidia.conf << 'LXC_GPU_EOF'
+# NVIDIA GPU для контейнера: подключение — строка в конфиге контейнера
+#   lxc.include = /etc/lxc/profiles/gpu-nvidia.conf
+# (sudo lxc-ai-create ИМЯ делает это сам). Хук пробрасывает /dev/nvidia*, libcuda, NVML и
+# nvidia-smi хостовой версии; только непривилегированные контейнеры (idmap — в default.conf).
+lxc.environment = NVIDIA_VISIBLE_DEVICES=all
+lxc.environment = NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics
+lxc.hook.mount = /usr/share/lxc/hooks/nvidia
+LXC_GPU_EOF
+
+# NetworkManager не должен управлять мостом и veth контейнеров
+install -d /etc/NetworkManager/conf.d
+cat > /etc/NetworkManager/conf.d/10-lxc-unmanaged.conf << 'LXC_NM_EOF'
+[keyfile]
+unmanaged-devices=interface-name:lxcbr0;interface-name:veth*
+LXC_NM_EOF
+
+# Обычный пользователь тоже может запускать контейнеры: до 10 veth на lxcbr0
+if [[ -n "${USERNAME:-}" ]]; then
+    grep -q "^$USERNAME veth lxcbr0" /etc/lxc/lxc-usernet 2>/dev/null || echo "$USERNAME veth lxcbr0 10" >> /etc/lxc/lxc-usernet
+fi
+
+cat > /usr/local/bin/lxc-ai-create << 'LXC_AI_EOF'
+#!/bin/bash
+# lxc-ai-create — контейнер для AI/ML с пробросом NVIDIA GPU (непривилегированный)
+# Использование: sudo lxc-ai-create ИМЯ [дистрибутив [релиз]]   (по умолчанию ubuntu noble)
+set -euo pipefail
+if [[ $EUID -ne 0 ]]; then
+    echo "Запускать от root: sudo lxc-ai-create ИМЯ [дистрибутив [релиз]]" >&2
+    exit 1
+fi
+NAME=${1:-}
+DISTRO=${2:-ubuntu}
+RELEASE=${3:-noble}
+if [[ -z "$NAME" ]]; then
+    echo "Использование: sudo lxc-ai-create ИМЯ [дистрибутив [релиз]]" >&2
+    exit 1
+fi
+if [[ ! -e /usr/share/lxc/hooks/nvidia || ! -x /usr/bin/nvidia-container-cli ]]; then
+    echo "Нет NVIDIA-хука LXC или libnvidia-container — GPU пробросить нельзя" >&2
+    exit 1
+fi
+lxc-create -n "$NAME" -t download -- -d "$DISTRO" -r "$RELEASE" -a amd64
+echo "lxc.include = /etc/lxc/profiles/gpu-nvidia.conf" >> "/var/lib/lxc/$NAME/config"
+lxc-start -n "$NAME" -d
+ip_addr=""
+for _ in $(seq 1 30); do
+    ip_addr=$(lxc-info -n "$NAME" -iH 2>/dev/null | head -n 1 || true)
+    [[ -n "$ip_addr" ]] && break
+    sleep 1
+done
+echo "Контейнер $NAME запущен (${ip_addr:-IP ещё не получен}). Проверка GPU:"
+echo "  sudo lxc-attach -n $NAME -- nvidia-smi"
+LXC_AI_EOF
+chmod 755 /usr/local/bin/lxc-ai-create
+
+systemctl enable lxc-net lxcfs
 
 echo "==> [Фаза C] Донастройка завершена"
 CHROOT_EOF
@@ -1107,6 +1651,17 @@ sed -i "s|KERNEL_PKG_PLACEHOLDER|$KERNEL_PKG|g; s|SWAP_KERNEL_PLACEHOLDER|$SWAP_
 if [[ "$MODE" == "unattended" ]]; then
     cp "$SCENARIO_FILE" /mnt/root/p510-scenario.env
     chmod 600 /mnt/root/p510-scenario.env
+
+    # Путь к ассету берём от расположения скрипта, а не от CWD: запуск возможен из любого каталога.
+    SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    P10K_ASSET="$SCRIPT_DIR/assets/p10k-extravagant.zsh"
+    if [[ -f "$P10K_ASSET" ]]; then
+        cp "$P10K_ASSET" /mnt/root/p10k.zsh
+        chmod 644 /mnt/root/p10k.zsh
+    else
+        # Отсутствие ассета не ошибка: C.9 откатится на штатный пресет rainbow из пакета zsh-theme-powerlevel10k.
+        echo "    p10k: $P10K_ASSET не найден — будет использован штатный пресет rainbow"
+    fi
 fi
 
 # Выполнение chroot-скрипта
@@ -1141,10 +1696,69 @@ echo "==> Размонтирование второго ESP"
 umount /mnt/efi_b
 rmdir /mnt/efi_b
 
-echo "==> Создание NVRAM-записи для второго ESP"
-arch-chroot /mnt efibootmgr --create --disk "/dev/$DISK2" --part 1 \
-    --label "rEFInd (backup)" \
-    --loader '\EFI\BOOT\BOOTX64.EFI'
+echo "==> Создание NVRAM-записей для обоих ESP"
+# efibootmgr работает на хосте, а не в chroot: NVRAM доступна только из запущенного ядра.
+# Записи ищем по точной метке: поиск по подстроке "rEFInd" задел бы чужие записи,
+# например стоковую "rEFInd Boot Manager" от инсталлятора.
+boot_ids_by_label() {
+    efibootmgr | awk -v want="$1" '
+        /^Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/ {
+            id = substr($0, 5, 4)
+            rest = substr($0, 9)
+            sub(/^[* ]+/, "", rest)
+            split(rest, parts, "\t")
+            sub(/ +$/, "", parts[1])
+            if (parts[1] == want) print id
+        }'
+}
+
+# Повторный прогон без удаления старых записей плодит дубли в NVRAM.
+for staleLabel in "rEFInd (primary)" "rEFInd (backup)"; do
+    while read -r staleId; do
+        echo "    удаляю старую запись Boot$staleId ($staleLabel)"
+        efibootmgr -b "$staleId" -B >/dev/null
+    done < <(boot_ids_by_label "$staleLabel")
+done
+
+# Путь к загрузчику зависит от того, как rEFInd попал на ESP: refind-install кладёт
+# fallback-загрузчик в EFI/BOOT, а если его нет — грузим из собственного каталога.
+LOADER='\EFI\BOOT\BOOTX64.EFI'
+if [[ ! -f /mnt/boot/efi/EFI/BOOT/bootx64.efi && -f /mnt/boot/efi/EFI/refind/refind_x64.efi ]]; then
+    LOADER='\EFI\refind\refind_x64.efi'
+fi
+echo "    loader: $LOADER"
+
+# ESP всегда на разделе 1 каждого диска (см. PART1_1/PART2_1 выше).
+efibootmgr --create --disk "/dev/$DISK1" --part 1 \
+    --label "rEFInd (primary)" --loader "$LOADER" >/dev/null
+echo "    создана запись rEFInd (primary) на /dev/$DISK1"
+efibootmgr --create --disk "/dev/$DISK2" --part 1 \
+    --label "rEFInd (backup)" --loader "$LOADER" >/dev/null
+echo "    создана запись rEFInd (backup) на /dev/$DISK2"
+
+# Номер, который вернул create, не используем: id берём по метке из вывода efibootmgr.
+PRIMARY_BOOT_ID=$(boot_ids_by_label "rEFInd (primary)" | head -n 1)
+BACKUP_BOOT_ID=$(boot_ids_by_label "rEFInd (backup)" | head -n 1)
+if [[ -z "$PRIMARY_BOOT_ID" || -z "$BACKUP_BOOT_ID" ]]; then
+    echo "ОШИБКА: созданные NVRAM-записи не найдены в выводе efibootmgr" >&2
+    exit 1
+fi
+
+# primary и backup — первыми; остальные записи (Shell, Windows и т.п.) сохраняем
+# в прежнем порядке. Дубли в BootOrder отбрасываем, иначе efibootmgr -o примет
+# их как есть и порядок станет непредсказуемым.
+ORDER_CURRENT=$(efibootmgr | awk '/^BootOrder:/ { print $2 }')
+IFS=, read -ra ORDER_ARRAY <<< "$ORDER_CURRENT"
+NEW_ORDER="$PRIMARY_BOOT_ID,$BACKUP_BOOT_ID"
+for orderId in "${ORDER_ARRAY[@]}"; do
+    case ",$NEW_ORDER," in
+        *",$orderId,"*) continue ;;
+    esac
+    NEW_ORDER+=",$orderId"
+done
+efibootmgr -o "$NEW_ORDER" >/dev/null
+echo "==> Итоговый порядок загрузки:"
+efibootmgr | grep BootOrder
 
 # ==============================================================================
 # Шаг 15: Установка pacman-хука синхронизации ESP
@@ -1223,6 +1837,12 @@ chmod +x /mnt/usr/local/bin/sync-efi-mirror.sh
 # Финал
 # ==============================================================================
 log_step "Завершение установки"
+
+# Перезагрузка во время ресинка безопасна, но отказоустойчивость появляется только
+# после его окончания — до тех пор зеркало фактически не защищает.
+echo "==> Ожидание окончания ресинка RAID (отказоустойчивость — только после него)"
+# || true: без активного ресинка mdadm --wait завершается ненулевым кодом — это норма.
+mdadm --wait /dev/md0 /dev/md1 || true
 
 echo "==> Размонтирование всех разделов"
 umount -R /mnt

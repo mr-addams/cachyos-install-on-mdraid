@@ -91,8 +91,12 @@ genfstab -U /mnt >> /mnt/etc/fstab
 
 ```bash
 arch-chroot /mnt
-mdadm --detail --scan >> /etc/mdadm.conf
+{ echo "HOMEHOST <ignore>"; mdadm --detail --scan; } > /etc/mdadm.conf
 ```
+
+`HOMEHOST <ignore>` обязателен первой строкой: массивы созданы в live-окружении с его hostname,
+а в initramfs и установленной системе hostname другой. Без этой строки udev считает массивы чужими,
+root по UUID не находится и загрузка падает в emergency shell.
 
 `/etc/mkinitcpio.conf` — добавить `mdadm_udev` перед `filesystems`:
 ```
@@ -110,18 +114,21 @@ refind-install --usedefault /dev/sda1
 
 `/boot` не на ESP, а на отдельном ext4/RAID1 — rEFInd должен читать его через встроенный EFI-драйвер ext4:
 
+`--usedefault` кладёт rEFInd в `EFI/BOOT/` (fallback-путь прошивки, NVRAM не меняется), поэтому
+конфиг и драйверы — в `EFI/BOOT/`, а не в `EFI/refind/`:
+
 ```bash
-mkdir -p /boot/efi/EFI/refind/drivers_x64
+mkdir -p /boot/efi/EFI/BOOT/drivers_x64
 cp /usr/share/refind/drivers_x64/ext4_x64.efi \
-   /boot/efi/EFI/refind/drivers_x64/
+   /boot/efi/EFI/BOOT/drivers_x64/
 ```
 (путь пакета может отличаться — проверить `pacman -Ql refind | grep drivers_x64`).
 
-`/boot/efi/EFI/refind/refind.conf` — стансь с явным путём на volume `/boot`:
+`/boot/efi/EFI/BOOT/refind.conf` — стансь с явным путём на volume `/boot`:
 
 ```
 menuentry "CachyOS" {
-    icon     /EFI/refind/icons/os_arch.png
+    icon     /EFI/BOOT/icons/os_arch.png
     volume   "cachy_boot"
     loader   /vmlinuz-linux-cachyos
     initrd   /initramfs-linux-cachyos.img
