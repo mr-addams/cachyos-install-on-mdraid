@@ -1154,6 +1154,39 @@ else
 fi
 
 # ------------------------------------------------------------------
+# C.2d: NVIDIA в initramfs — блэклист nouveau и ранний KMS. Только если поставлен драйвер NVIDIA.
+#       Блэклист: два драйвера на одну карту конфликтуют за устройство.
+#       WHY свой файл, хотя nvidia-utils уже ставит такой блэклист: правило из пакета не наше,
+#       его могут убрать/переименовать, а скрипт не должен от него зависеть.
+#       WHY «install … /bin/false» кроме blacklist: blacklist не мешает загрузке по зависимости
+#       или явному modprobe, install-строка блокирует загрузку полностью.
+#       Ранний KMS: без модулей nvidia в initramfs plymouth рисует на EFI-framebuffer (simpledrm),
+#       а udev settle перед plasmalogin ждёт позднюю загрузку nvidia ~4 с — всё это время экран
+#       пуст, потом модесет. Те же два drop-in'а штатно кладёт chwd (профиль nvidia-open-dkms,
+#       pre_install), поэтому имена и содержимое совпадают: chwd потом корректно их уберёт.
+#       Хук kms убираем: он тянет в initramfs nouveau и его прошивки (образ меньше на ~20 МБ).
+#       WHY до C.3: хук modconf копирует /etc/modprobe.d в initramfs, правила должны попасть туда.
+# ------------------------------------------------------------------
+if pacman -Q nvidia-utils >/dev/null 2>&1; then
+    echo "==> C.2d: NVIDIA — блэклист nouveau и ранний KMS"
+    cat > /etc/modprobe.d/blacklist-nouveau.conf << 'NOUVEAU_BLACKLIST_EOF'
+blacklist nouveau
+install nouveau /bin/false
+NOUVEAU_BLACKLIST_EOF
+    install -d /etc/mkinitcpio.conf.d
+    cat > /etc/mkinitcpio.conf.d/10-chwd.conf << 'NVIDIA_MODULES_EOF'
+# Ранний KMS NVIDIA — как кладёт chwd (профиль nvidia-open-dkms, pre_install).
+MODULES+=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)
+NVIDIA_MODULES_EOF
+    cat > /etc/mkinitcpio.conf.d/10-chwd-kms.conf << 'NVIDIA_KMS_EOF'
+# kms не нужен: он тянет nouveau и его прошивки в initramfs, а nvidia идёт через MODULES.
+HOOKS=(${HOOKS[@]/kms/})
+NVIDIA_KMS_EOF
+else
+    echo "==> C.2d: драйвер NVIDIA не установлен — пропуск"
+fi
+
+# ------------------------------------------------------------------
 # C.3: Пересборка initramfs
 # ------------------------------------------------------------------
 echo "==> C.3: mkinitcpio -P"
@@ -1270,10 +1303,25 @@ REFIND_ICON_PREFIX=${REFIND_DIR#/boot/efi}
 # scanfor manual: автоскан находит ядра в /boot, но без refind_linux.conf у них нет
 # root= — такие записи уходят в emergency shell. Оставляем только ручные записи;
 # ряд инструментов (memtest86 и т.д.) от scanfor не зависит.
+# use_graphics_for linux: без него rEFInd при запуске ядра печатает «Starting vmlinuz… / Using load
+# options…» в текстовом режиме; с ним — очищает экран цветом фона и ничего не выводит.
+# Баннер: цвет этой заливки rEFInd берёт из левого верхнего пикселя баннера (исходник refind/screen.c,
+# BltClearScreen), а без своего баннера это светлый встроенный. Поэтому баннер — чёрный, 480x140, с
+# логотипом: чёрный экран между выбором записи и plymouth вместо белого. Путь — относительно каталога
+# с rEFInd ($REFIND_DIR), поэтому файл кладём рядом с refind.conf. Картинку на время загрузки ядра
+# rEFInd показать не умеет: при запуске ОС он только заливает экран цветом, баннер рисует лишь меню.
+REFIND_BANNER_FILE=refind-banner.png
+REFIND_BANNER_LINE=""
+if [[ -f /root/refind-banner.png ]]; then
+    install -m 644 /root/refind-banner.png "$REFIND_DIR/$REFIND_BANNER_FILE"
+    REFIND_BANNER_LINE="banner $REFIND_BANNER_FILE"
+fi
 cat > "$REFIND_DIR/refind.conf" << REFIND_CONF_EOF
 timeout 5
 default_selection "CachyOS RAID1 main"
 scanfor manual
+use_graphics_for linux
+${REFIND_BANNER_LINE}
 menuentry "CachyOS RAID1 main" {
     icon     ${REFIND_ICON_PREFIX}/icons/os_arch.png
     volume   "BOOT_LABEL_PLACEHOLDER"
@@ -1664,6 +1712,17 @@ if [[ "$MODE" == "unattended" ]]; then
     fi
 fi
 
+# Баннер rEFInd нужен в обоих режимах (меню есть всегда), поэтому вне блока unattended.
+# Путь считаем заново: в интерактиве SCRIPT_DIR из блока выше не задан.
+BANNER_ASSET="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/assets/refind-banner.png"
+if [[ -f "$BANNER_ASSET" ]]; then
+    cp "$BANNER_ASSET" /mnt/root/refind-banner.png
+    chmod 644 /mnt/root/refind-banner.png
+else
+    # Не ошибка: C.7 тогда не пишет banner, rEFInd использует встроенный (светлый фон при запуске ОС).
+    echo "    banner: $BANNER_ASSET не найден — будет встроенный баннер rEFInd"
+fi
+
 # Выполнение chroot-скрипта
 echo "==> Запуск настройки в chroot"
 if [[ ! -x /mnt/root/chroot-setup.sh ]]; then
@@ -1674,7 +1733,7 @@ fi
 arch-chroot /mnt /bin/bash /root/chroot-setup.sh
 
 # Блок C.9 затирает сценарный файл изнутри; это — страховка на случай обрыва.
-rm -f /mnt/root/p510-scenario.env
+rm -f /mnt/root/p510-scenario.env /mnt/root/refind-banner.png
 
 # ==============================================================================
 # ФАЗА D — Зеркалирование ESP + автохук
