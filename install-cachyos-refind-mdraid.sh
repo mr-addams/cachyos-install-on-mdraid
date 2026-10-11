@@ -1596,6 +1596,73 @@ else
     echo "    INSTALL_GAMING=no — игровой набор пропущен"
 fi
 
+# ------------------------------------------------------------------
+# C.10b: RDP-доступ — xrdp + сессия Plasma X11. Отключается INSTALL_XRDP=no.
+#        WHY xrdp, а не родной KRdp: KRdp подключается только к уже залогиненной
+#        графической сессии (удалённого входа с нуля в Plasma 6.7 нет), а xrdp сам создаёт
+#        сессию при входе — машина работает без монитора. Цена: сессия X11, не Wayland.
+#        xrdp и xorgxrdp есть только в AUR, поэтому:
+#        - собираем от обычного пользователя (makepkg от root не запускается и небезопасен);
+#        - закрепляем коммиты AUR, которые прочитаны вручную (PKGBUILD + патч arch-config.diff:
+#          исходники с GitHub neutrinolabs, контрольные суммы, патч трогает только startwm.sh) —
+#          «последний коммит» AUR мог бы незаметно подменить сценарий сборки;
+#        - любая неудача (сеть, keyserver) не обрывает установку: RDP — удобство, не основа системы.
+#        --nocheck: тесты xrdp (make check) не нужны для установки и требуют лишних зависимостей.
+#        Версии на момент проверки: xrdp 0.10.6.1-1, xorgxrdp 0.10.5-1.
+# ------------------------------------------------------------------
+install_xrdp() {
+    local build_root name commit
+    pacman -S --noconfirm --needed git base-devel plasma-x11-session nasm cmocka check \
+        libxrandr libfdk-aac ffmpeg imlib2 fuse3 x264 xorg-server xorg-server-devel \
+        libxfont2 xorg-xauth xorg-xinit
+    build_root=$(mktemp -d /var/tmp/xrdp-build.XXXXXX)
+    chown "$USERNAME" "$build_root"
+    # Ключ подписи xorgxrdp (Koichiro IWAO) — makepkg проверяет подпись исходников; второй
+    # keyserver — на случай, если первый недоступен.
+    runuser -u "$USERNAME" -- env HOME="/home/$USERNAME" gpg --batch --keyserver keyserver.ubuntu.com \
+        --recv-keys 61ECEABBF2BB40E3A35DF30A9F72CDBC01BF10EB \
+        || runuser -u "$USERNAME" -- env HOME="/home/$USERNAME" gpg --batch --keyserver keys.openpgp.org \
+            --recv-keys 61ECEABBF2BB40E3A35DF30A9F72CDBC01BF10EB
+    # Порядок важен: xorgxrdp собирается с xrdp в makedepends, поэтому xrdp ставим первым.
+    for name in xrdp xorgxrdp; do
+        case "$name" in
+            xrdp)     commit=29669f7baa3f9c80ebe50a19c8cf0f1200559b63 ;;
+            xorgxrdp) commit=b04814d56be91d993f4d76370c473dda1b691641 ;;
+        esac
+        runuser -u "$USERNAME" -- git clone -q "https://aur.archlinux.org/$name.git" "$build_root/$name"
+        runuser -u "$USERNAME" -- git -C "$build_root/$name" checkout -q "$commit"
+        (cd "$build_root/$name" && runuser -u "$USERNAME" -- env HOME="/home/$USERNAME" \
+            makepkg --nocheck --noconfirm -f)
+        pacman -U --noconfirm "$build_root/$name/$name"-[0-9]*.pkg.tar.zst
+    done
+    [[ -n "$build_root" ]] && rm -rf -- "$build_root"
+    # Свой startwm.sh вместо ~/.xinitrc: настройка нужна всем пользователям сразу.
+    # Локаль берём из системной — иначе в RDP-сессии C/POSIX и ломается кириллица.
+    cat > /etc/xrdp/startwm.sh << 'XRDP_STARTWM_EOF'
+#!/bin/sh
+# Запуск сессии Plasma (X11) для RDP-входа через xrdp.
+if [ -r /etc/locale.conf ]; then
+    . /etc/locale.conf
+    export LANG
+fi
+exec startplasma-x11
+XRDP_STARTWM_EOF
+    chmod 755 /etc/xrdp/startwm.sh
+    systemctl enable xrdp-sesman.service xrdp.service
+}
+if [[ "${INSTALL_XRDP:-yes}" == "yes" ]]; then
+    echo "==> C.10b: RDP-доступ (xrdp + Plasma X11)"
+    export USERNAME
+    # Отдельный bash -e: внутри «if» set -e не действует, и функция продолжала бы работу после сбоя.
+    if bash -e -c "$(declare -f install_xrdp); install_xrdp"; then
+        echo "    xrdp установлен и включён (порт 3389)"
+    else
+        echo "    ПРЕДУПРЕЖДЕНИЕ: xrdp установить не удалось — RDP не настроен, остальная установка продолжается" >&2
+    fi
+else
+    echo "    INSTALL_XRDP=no — RDP пропущен"
+fi
+
 # subuid/subgid для root: диапазон 1000000-1065535 (у обычного пользователя useradd даёт 100000+)
 for idmap_file in /etc/subuid /etc/subgid; do
     grep -q '^root:' "$idmap_file" 2>/dev/null || echo "root:1000000:65536" >> "$idmap_file"
@@ -1669,7 +1736,10 @@ if [[ ! -e /usr/share/lxc/hooks/nvidia || ! -x /usr/bin/nvidia-container-cli ]];
     exit 1
 fi
 lxc-create -n "$NAME" -t download -- -d "$DISTRO" -r "$RELEASE" -a amd64
-echo "lxc.include = /etc/lxc/profiles/gpu-nvidia.conf" >> "/var/lib/lxc/$NAME/config"
+# Каталог контейнеров не хардкодим: lxc.lxcpath могут переопределить в /etc/lxc/lxc.conf.
+LXC_PATH=$(lxc-config lxc.lxcpath)
+CONTAINER_CONFIG="$LXC_PATH/$NAME/config"
+echo "lxc.include = /etc/lxc/profiles/gpu-nvidia.conf" >> "$CONTAINER_CONFIG"
 lxc-start -n "$NAME" -d
 ip_addr=""
 for _ in $(seq 1 30); do
