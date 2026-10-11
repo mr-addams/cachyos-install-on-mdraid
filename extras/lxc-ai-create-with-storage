@@ -1,0 +1,71 @@
+#!/bin/bash
+# ВАРИАНТ lxc-ai-create С ОБЩИМ AI-ХРАНИЛИЩЕМ — не входит в установщик, применяется вручную на машине.
+# Это тот же хелпер, что ставит install-cachyos-refind-mdraid.sh (C.10), плюс подключение хранилища.
+# Ставится так (на машине с диском под AI, смонтированным, например, в /srv/ai):
+#   echo "AI_DATA_DIR=/srv/ai" | sudo tee /etc/lxc/ai-data.conf
+#   sudo install -m 755 lxc-ai-create-with-storage /usr/local/bin/lxc-ai-create
+# Проверено на живой машине: /models — ro, /work — rw, GPU виден, права chown на контейнерный root.
+# lxc-ai-create — контейнер для AI/ML с пробросом NVIDIA GPU (непривилегированный)
+# Использование: sudo lxc-ai-create ИМЯ [дистрибутив [релиз]]   (по умолчанию ubuntu noble)
+set -euo pipefail
+if [[ $EUID -ne 0 ]]; then
+    echo "Запускать от root: sudo lxc-ai-create ИМЯ [дистрибутив [релиз]]" >&2
+    exit 1
+fi
+NAME=${1:-}
+DISTRO=${2:-ubuntu}
+RELEASE=${3:-noble}
+if [[ -z "$NAME" ]]; then
+    echo "Использование: sudo lxc-ai-create ИМЯ [дистрибутив [релиз]]" >&2
+    exit 1
+fi
+if [[ ! -e /usr/share/lxc/hooks/nvidia || ! -x /usr/bin/nvidia-container-cli ]]; then
+    echo "Нет NVIDIA-хука LXC или libnvidia-container — GPU пробросить нельзя" >&2
+    exit 1
+fi
+lxc-create -n "$NAME" -t download -- -d "$DISTRO" -r "$RELEASE" -a amd64
+# Каталог контейнеров не хардкодим: lxc.lxcpath могут переопределить в /etc/lxc/lxc.conf.
+LXC_PATH=$(lxc-config lxc.lxcpath)
+CONTAINER_CONFIG="$LXC_PATH/$NAME/config"
+echo "lxc.include = /etc/lxc/profiles/gpu-nvidia.conf" >> "$CONTAINER_CONFIG"
+
+# Общее AI-хранилище (необязательно): /etc/lxc/ai-data.conf с AI_DATA_DIR=/путь/к/диску.
+#   models/      — общий каталог моделей, во ВСЕ контейнеры только на чтение: у контейнеров общий
+#                  page cache хоста, поэтому вторая загрузка той же модели идёт из RAM;
+#   work/ИМЯ/    — рабочий каталог этого контейнера (/work), на запись: результаты, логи, кэши.
+AI_DATA_DIR=""
+[[ -f /etc/lxc/ai-data.conf ]] && source /etc/lxc/ai-data.conf
+if [[ -n "$AI_DATA_DIR" && -d "$AI_DATA_DIR" ]]; then
+    # root контейнера на хосте — не uid 0, а начало его idmap (непривилегированный контейнер):
+    # без chown на этот uid запись в /work из контейнера не пройдёт.
+    CONTAINER_ROOT_UID=$(awk '/^lxc\.idmap *= *u 0 /{print $5; exit}' "$CONTAINER_CONFIG")
+    CONTAINER_ROOT_UID=${CONTAINER_ROOT_UID:-1000000}
+    install -d -m 755 "$AI_DATA_DIR/models"
+    install -d -m 755 -o "$CONTAINER_ROOT_UID" -g "$CONTAINER_ROOT_UID" "$AI_DATA_DIR/work/$NAME"
+    {
+        echo "lxc.mount.entry = $AI_DATA_DIR/models models none bind,ro,create=dir 0 0"
+        echo "lxc.mount.entry = $AI_DATA_DIR/work/$NAME work none bind,rw,create=dir 0 0"
+    } >> "$CONTAINER_CONFIG"
+    # Кэши — на NVMe, а не в rootfs. Профиль работает для login-шеллов; у systemd-сервисов внутри
+    # контейнера переменные задаются в их юнитах отдельно.
+    install -d -m 755 "$LXC_PATH/$NAME/rootfs/etc/profile.d"
+    cat > "$LXC_PATH/$NAME/rootfs/etc/profile.d/ai-work.sh" << 'AI_WORK_PROFILE_EOF'
+export HF_HOME=/work/hf
+export TRITON_CACHE_DIR=/work/cache/triton
+export TORCHINDUCTOR_CACHE_DIR=/work/cache/torchinductor
+export XDG_CACHE_HOME=/work/cache
+AI_WORK_PROFILE_EOF
+    chown "$CONTAINER_ROOT_UID:$CONTAINER_ROOT_UID" "$LXC_PATH/$NAME/rootfs/etc/profile.d/ai-work.sh"
+    echo "AI-хранилище: /models (ro, общий) и /work (rw, $AI_DATA_DIR/work/$NAME)"
+elif [[ -n "$AI_DATA_DIR" ]]; then
+    echo "ПРЕДУПРЕЖДЕНИЕ: AI_DATA_DIR=$AI_DATA_DIR не существует (диск не смонтирован?) — контейнер создан без AI-хранилища" >&2
+fi
+lxc-start -n "$NAME" -d
+ip_addr=""
+for _ in $(seq 1 30); do
+    ip_addr=$(lxc-info -n "$NAME" -iH 2>/dev/null | head -n 1 || true)
+    [[ -n "$ip_addr" ]] && break
+    sleep 1
+done
+echo "Контейнер $NAME запущен (${ip_addr:-IP ещё не получен}). Проверка GPU:"
+echo "  sudo lxc-attach -n $NAME -- nvidia-smi"
