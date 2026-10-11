@@ -994,6 +994,7 @@ pacman-key --init >/dev/null 2>&1 || true
 pacman-key --populate archlinux cachyos
 pacman -Sy
 
+
 # CachyOS заменяет zlib на zlib-ng-compat (в их репозитории Replaces: zlib, для lib32 то же),
 # и пакеты репозитория (wine-cachyos, proton-cachyos, steam-обвязка) собраны под него.
 # archinstall ставит базу с zlib из core; при pacman -S без полного апгрейда «замены» не
@@ -1002,6 +1003,31 @@ pacman -Sy
 # удаление конфликтующего пакета (поставщик libz.so остаётся — zlib-ng-compat provides zlib).
 echo "==> C.0a: zlib -> zlib-ng-compat (как в штатной CachyOS)"
 pacman -S --noconfirm --ask 4 --needed zlib-ng-compat lib32-zlib-ng-compat
+
+# Оптимизированные репозитории CachyOS (x86-64-v3): пересборки пакетов Arch (glibc, systemd, Qt,
+# ffmpeg...). Порядок решает, откуда ставится пакет: pacman берёт его из ПЕРВОГО репозитория, где он
+# есть, поэтому v3-репозитории стоят перед [cachyos], а тот — перед core/extra. Итог — «сначала
+# CachyOS, Arch только если пакета у них нет»; без v3 всё, кроме их собственных пакетов, было бы
+# собрано Arch. Это штатный порядок CachyOS (их cachyos-repo.sh делает то же).
+# Условие — процессор умеет v3 (определяем динамическим загрузчиком); иначе v3-пакеты не запустятся.
+# v4 (AVX-512) не подключаем: не проверено на железе. Если процессор слабее v3 — остаёмся на [cachyos].
+# CACHYOS_V3=no отключает.
+echo "==> C.0a: Оптимизированные репозитории CachyOS (x86-64-v3)"
+if [[ "${CACHYOS_V3:-yes}" != "yes" ]]; then
+    echo "    CACHYOS_V3=no — пропуск"
+elif ! /lib/ld-linux-x86-64.so.2 --help 2>/dev/null | grep -q 'x86-64-v3 (supported'; then
+    echo "    процессор не поддерживает x86-64-v3 — остаёмся на [cachyos] без v3"
+elif grep -q '^\[cachyos-v3\]' /etc/pacman.conf; then
+    echo "    v3-репозитории уже подключены — OK"
+else
+    pacman -S --noconfirm --needed cachyos-v3-mirrorlist
+    sed -i '/^\[cachyos\]/i [cachyos-v3]\nInclude = /etc/pacman.d/cachyos-v3-mirrorlist\n\n[cachyos-core-v3]\nInclude = /etc/pacman.d/cachyos-v3-mirrorlist\n\n[cachyos-extra-v3]\nInclude = /etc/pacman.d/cachyos-v3-mirrorlist\n' /etc/pacman.conf
+    pacman -Sy
+    # Полный апгрейд: база от archinstall — сборки Arch, а ядро и драйвер далее берутся из v3. Без него
+    # первое же «pacman -Syu» после установки заменит ~900 пакетов разом. Не фатально: при сбое
+    # остаются рабочие пакеты Arch, а апгрейд можно повторить вручную.
+    pacman -Su --noconfirm || echo "    ПРЕДУПРЕЖДЕНИЕ: апгрейд на v3 не завершился — повторите «pacman -Syu» после установки" >&2
+fi
 
 echo "==> C.0: Доустановка пакетов в таргет"
 pacman -S --noconfirm --needed mdadm refind rsync efibootmgr gdisk dosfstools
